@@ -1,0 +1,6 @@
+# Streamlit observability dashboard — layered ON TOP of the main app's environment.
+# Install the main app's requirements first (shares its src/, settings, creds), then these.
+streamlit>=1.36
+plotly>=5.22
+pandas>=2.0
+numpy>=1.26

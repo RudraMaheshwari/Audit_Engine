@@ -1,0 +1,34 @@
+# Secrets — NEVER bake into the image; injected at runtime via --env-file / -e.
+.env
+.env.*
+!.env.example
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs (must not be copied into the Linux image)
+venv/
+.venv/
+env/
+
+# Local dev artifacts not needed at runtime
+output/
+tests/
+docs/
+scratchpad/
+*.md
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+.vscode/
+.idea/
+
+# The Streamlit observability dashboard is a SEPARATE app, not served by this API image.
+# Remove this line if you want it inside the image (it also needs streamlit_app/requirements.txt).
+streamlit_app/

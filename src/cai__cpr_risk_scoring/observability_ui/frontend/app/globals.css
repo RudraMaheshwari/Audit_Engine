@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 244 247 252;
+  --surface: 255 255 255;
+  --surface2: 247 249 255;
+  --border: 227 232 244;
+  --text: 20 26 46;
+  --muted: 92 102 128;
+  --accent: 235 23 0;
+  --accent2: 47 107 255;
+}
+.dark {
+  --bg: 11 16 32;
+  --surface: 20 27 51;
+  --surface2: 26 35 68;
+  --border: 36 48 85;
+  --text: 232 236 248;
+  --muted: 154 166 194;
+  --accent: 255 77 79;
+  --accent2: 91 140 255;
+}
+
+html, body { height: 100%; }
+body {
+  @apply bg-bg text-text font-sans antialiased;
+  background-image: radial-gradient(1200px 600px at 10% -10%, rgb(var(--surface2) / 0.6), transparent);
+}
+
+@layer components {
+  .card { @apply rounded-xl2 border border-border bg-gradient-to-b from-surface to-surface2 shadow-card; }
+  .kpi-label { @apply text-[0.68rem] font-bold uppercase tracking-wider text-muted; }
+  .kpi-value { @apply mt-1 text-[1.7rem] font-extrabold leading-none; }
+  .kpi-sub { @apply mt-1 text-xs text-muted; }
+  .navlink { @apply rounded-xl px-3.5 py-2 text-sm font-semibold text-muted transition hover:text-text; }
+  .navlink-active { @apply bg-accent text-white shadow; }
+  .input { @apply w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-accent2; }
+  .btn { @apply rounded-xl border border-border bg-surface px-3 py-2 text-sm font-semibold transition hover:border-accent hover:text-accent; }
+  .btn-primary { @apply rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90; }
+  .chip { @apply inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs; }
+}

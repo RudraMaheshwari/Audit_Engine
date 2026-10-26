@@ -1,0 +1,5 @@
+# The backend REUSES the main app's environment (Settings, Lakebase, Databricks, embeddings, LLM), so
+# install the main requirements.txt first. These are the only extras the API layer itself needs:
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# (psycopg, sqlalchemy, databricks-sql-connector, langchain, azure, etc. come from the main requirements.)
