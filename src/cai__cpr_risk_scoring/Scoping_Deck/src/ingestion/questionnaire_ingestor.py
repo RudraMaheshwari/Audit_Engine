@@ -223,7 +223,9 @@ class QuestionnaireIngestor:
     @classmethod
     def _to_chunk(cls, question: AuditQuestion) -> QuestionnaireChunk:
         return QuestionnaireChunk(
-            chunk_id=f"qn::{question.auditor_id}::{question.questionnaire_type}::{question.question_id}",
+            # SAME scheme Risk Analysis uses (runner._build_questionnaire_records) so a fallback
+            # ingest OVERWRITES the shared rows by primary key instead of creating a 2nd copy.
+            chunk_id=f"{question.auditor_id}::{question.questionnaire_type}::{question.question_id}",
             content=cls._compose_content(question),
             question_id=question.question_id,
             question_text=question.question_text,

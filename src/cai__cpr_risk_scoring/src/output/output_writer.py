@@ -71,10 +71,16 @@ _FILE_NAME_RE = re.compile(r"File Name:\s*([^;\n]+)", re.IGNORECASE)
 _SOURCE_PREFIX_RE = re.compile(r"^Source:\s*[^;\n]+", re.IGNORECASE)
 
 
+# A dashboard/transactional TABLE cited as a "File Name" (e.g. gld__..._dashboard__cpr) — it is NOT a
+# supporting document. These must be labelled "Transactional Dashboard", never "Supporting Evidence".
+_DASHBOARD_TABLE_RE = re.compile(r"\bgld__[a-z0-9_]+__cpr\b|dashboard", re.IGNORECASE)
+
+
 def _correct_source_family(entry: str) -> str:
     """Rewrite an entry's 'Source: <family>' prefix to the file's authoritative family when the cited
     File Name matches a known policy file — so the label reflects the document's identity, not the index
-    it happened to be retrieved from. Unknown files are left exactly as written."""
+    it happened to be retrieved from. A dashboard/transactional table name is forced to "Transactional
+    Dashboard" (never Supporting Evidence). Unknown files are left exactly as written."""
     match = _FILE_NAME_RE.search(entry)
     if not match:
         return entry
@@ -82,13 +88,53 @@ def _correct_source_family(entry: str) -> str:
     for key, family in _POLICY_FAMILY_BY_FILE.items():
         if key.lower() in fname:
             return _SOURCE_PREFIX_RE.sub(f"Source: {family}", entry, count=1)
+    if _DASHBOARD_TABLE_RE.search(fname):
+        return _SOURCE_PREFIX_RE.sub("Source: Transactional Dashboard", entry, count=1)
     return entry
 
 
-def _normalize_source_details(text: str) -> str:
+def _norm_fname(name: str) -> str:
+    """Normalise a file name for tolerant matching: lowercase, drop extension + trailing '(1)'."""
+    n = (name or "").lower().strip()
+    n = re.sub(r"\.(pdf|xlsx?|docx?|pptx?|csv|json|txt)$", "", n)
+    n = re.sub(r"\s*\(\d+\)\s*$", "", n)   # trailing duplicate marker like " (1)"
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def _is_phantom_supporting(entry: str, valid_files: set[str]) -> bool:
+    """True when a Supporting-Evidence entry cites a file that is NOT among the auditor's indexed docs.
+    Lenient on purpose — keeps the citation on ANY reasonable name match, so a real file is never
+    dropped over a minor spelling difference (we prefer keeping over wrongly removing evidence)."""
+    low = " ".join(entry.lower().split())
+    if not low.startswith("source: supporting evidence"):
+        return False
+    m = re.search(r"file name:\s*([^;]+)", low)
+    if not m:
+        return False
+    cited = _norm_fname(m.group(1))
+    if not cited:
+        return False
+    return not any(cited == v or cited in v or v in cited for v in valid_files)
+
+
+def _source_dedup_key(entry: str) -> str:
+    """Key used to collapse duplicate 'Source:' entries. For Supporting Evidence (no section/page),
+    key on the file name only so the same document never appears twice; for everything else key on
+    the whole entry so distinct policy sections/pages are kept."""
+    low = " ".join(entry.lower().split())
+    if low.startswith("source: supporting evidence"):
+        m = re.search(r"file name:\s*([^;]+)", low)
+        if m:
+            return "supporting::" + m.group(1).strip()
+    return low
+
+
+def _normalize_source_details(text: str, valid_supporting_files: set[str] | None = None) -> str:
     """Put every 'Source:' entry on its own bulleted line, regardless of how the LLM joined
     them (';', '|', or bullets). Keeps each entry's internal 'File Name: …; Section: …; Page No.: …'.
-    Also corrects the 'Source:' family label for known policy files (see _POLICY_FAMILY_BY_FILE)."""
+    Also corrects the 'Source:' family label for known policy files (see _POLICY_FAMILY_BY_FILE).
+    When `valid_supporting_files` is provided (the auditor's actually-indexed doc names), drops any
+    Supporting-Evidence citation whose file is not among them (phantom/hallucinated file)."""
     if not text or "Source:" not in text:
         return text
     entries = []
@@ -98,9 +144,15 @@ def _normalize_source_details(text: str) -> str:
         if not part.startswith("Source:"):
             continue
         corrected = _correct_source_family(part)
-        # De-duplicate: the same evidence source must appear ONCE, even if the model repeated it
-        # (whitespace/case-insensitive key over the corrected entry).
-        key = " ".join(corrected.lower().split())
+        # Drop a phantom Supporting-Evidence file (cited but not in the auditor's index). Fail-open:
+        # only filters when the indexed-file set is actually available/non-empty.
+        if valid_supporting_files and _is_phantom_supporting(corrected, valid_supporting_files):
+            continue
+        # De-duplicate: the same evidence source must appear ONCE, even if the model repeated it.
+        # Supporting-evidence files carry no section/page, so the SAME file cited twice (with any
+        # trailing variation) must collapse to one — key on the file name alone. Policy entries keep
+        # full-entry keying so distinct sections/pages of the same policy file are preserved.
+        key = _source_dedup_key(corrected)
         if key in seen:
             continue
         seen.add(key)
@@ -180,6 +232,9 @@ class OutputWriter:
         self._repo = repo
         self._settings = settings
         self._translator = None
+        # Normalised set of the auditor's actually-indexed supporting-doc names. Empty = no filtering
+        # (fail-open). Populated by the runner via set_valid_supporting_files().
+        self._valid_supporting_files: set[str] = set()
         # Optional Delta mirror of the output sheets. Best-effort; disabled if no settings provided.
         self._delta = None
         if settings is not None:
@@ -188,6 +243,11 @@ class OutputWriter:
                 self._delta = DeltaOutputExporter(settings)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("OutputWriter: Delta exporter unavailable — Excel only | %s", exc)
+
+    def set_valid_supporting_files(self, names) -> None:
+        """Register the auditor's actually-indexed supporting-doc names so phantom (non-existent)
+        Supporting-Evidence citations are dropped from the output. Normalised for tolerant matching."""
+        self._valid_supporting_files = {_norm_fname(n) for n in (names or []) if n}
 
     def _local_language(self) -> str:
         return (getattr(self._settings, "audit_local_language", "") or "").strip() if self._settings else ""
@@ -393,7 +453,8 @@ class OutputWriter:
         reasoning    = parsed.get("risk_category_reasoning", "").strip()
         scope_area          = _display_scope(parsed.get("scope_area", "").strip()) or SCOPE_UNCLEAR_LABEL
         scope_area_reasoning = parsed.get("scope_area_reasoning", "").strip()
-        source              = _normalize_source_details(parsed.get("document_utilized", "").strip())
+        source              = _normalize_source_details(
+            parsed.get("document_utilized", "").strip(), self._valid_supporting_files)
 
         # Category is driven by the Risk Type (in risk_title) so the reviewer rule holds even if the
         # model emits an inconsistent band: only Potential Risk is scored (High/Medium/Low); Further

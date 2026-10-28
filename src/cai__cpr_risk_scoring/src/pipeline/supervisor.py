@@ -81,6 +81,18 @@ _QUANT_SIGNAL = re.compile(
     re.IGNORECASE,
 )
 
+# Quantitative/transactional INTENT in the QUESTION — so a question like "How much of the business is
+# government customers?" or "How are discounts/rebates determined?" still runs the NL-to-SQL agent even
+# when the RESPONSE is terse/non-numeric ("Zero"). Only consulted after risk-eval already flagged
+# transactional intent, so it narrows, never broadens, when the agent should run.
+_QUANT_INTENT = re.compile(
+    r"\bhow (?:much|many|often|large|big)\b"
+    r"|\bpercentage\b|\bproportion\b|%\s*of\b|\bnumber of\b|\bvolume\b|\bvalue of\b|\bamount\b"
+    r"|\bdiscount|rebate|margin|pricing|\bprice\b"
+    r"|\bcredit note|invoice|payment|disbursement|reimburse|transaction|spend|sales|honorari|fee for service\b",
+    re.IGNORECASE,
+)
+
 
 class AuditSupervisor:
     """
@@ -108,10 +120,12 @@ class AuditSupervisor:
         tpi_inventory_block: str = "",
         transactional_context: str = "",
         recurrence_context: str = "",
+        audit_context: str = "",
     ) -> None:
         self._tpi_inventory_block = tpi_inventory_block
         self._transactional_context = transactional_context
         self._recurrence_context = recurrence_context
+        self._audit_context = audit_context
         self._scope_id    = scope_identifier_agent.get_agent()
         self._hcbi        = hcbi_policy_agent.get_agent()
         self._policy      = policy_knowledge_agent.get_agent()
@@ -170,7 +184,10 @@ class AuditSupervisor:
             if questionnaire_type == "planning"
             else "JNJ MANAGEMENT RESPONSE"
         )
-        parts = [
+        parts = []
+        if self._audit_context:
+            parts.append(self._audit_context)
+        parts += [
             f"AUDIT QUESTION: {question_text}",
             f"{response_label}: {response_text}",
         ]
@@ -218,10 +235,18 @@ class AuditSupervisor:
 
         transactional_ctx = ""
         run_transactional = self._is_transactional(risk_eval_ctx)
-        if run_transactional and not self._has_quantitative_signal(response_text, followup_response):
+        # Run the agent when EITHER the response carries a numeric/currency signal OR the question
+        # itself is quantitative/transactional in intent (e.g. "how much…", discounts/credit notes).
+        # The latter ensures calc evidence (Col J) is produced even for terse responses like "Zero".
+        quantitative = (
+            self._has_quantitative_signal(response_text, followup_response)
+            or self._has_quantitative_signal(question_text, followup_question)
+            or bool(_QUANT_INTENT.search(f"{question_text}\n{followup_question}"))
+        )
+        if run_transactional and not quantitative:
             logger.info(
-                "[AuditSupervisor] Transactional flag set but response has no numeric/currency "
-                "signal — skipping transactional agent (deterministic guard)"
+                "[AuditSupervisor] Transactional flag set but neither response nor question has a "
+                "quantitative/transactional signal — skipping transactional agent (deterministic guard)"
             )
             run_transactional = False
         if run_transactional:
@@ -232,6 +257,7 @@ class AuditSupervisor:
                 "Query the transactional tables to validate the financial claims or "
                 "quantitative statements in the response above."
             )
+            trans_out: dict | None = None
             for _attempt in range(1, MAX_TRANS_RETRIES + 1):
                 try:
                     with observe(agent_name=AGENT_TRANSACTIONAL, prompt_name=_PROMPT_TRANSACTIONAL):
@@ -255,6 +281,13 @@ class AuditSupervisor:
                     "treating as No Risk for transactional component",
                     MAX_TRANS_RETRIES,
                 )
+            # Append the EXACT tables + SQL the agent actually ran (read from intermediate steps), so the
+            # calc evidence (Col J) always carries the real table names and queries — independent of what
+            # the LLM wrote in its prose answer.
+            if transactional_ctx and trans_out is not None:
+                exact_block = TransactionalDataAgent.build_exact_tables_block(trans_out)
+                if exact_block:
+                    transactional_ctx = f"{transactional_ctx}\n\n{exact_block}"
 
         classifier_msg = f"{eval_msg}\n\n=== RISK EVALUATION ===\n{risk_eval_ctx}"
         if transactional_ctx:

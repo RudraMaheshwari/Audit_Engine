@@ -52,6 +52,18 @@ class RiskAnalysisStartRequest(StartRunRequest):
     engagement_numbers: str = Field(..., examples=["1000,1001"])
     questionnaire: QuestionnaireTables = Field(..., description="IDR + Planning tables (required).")
     supporting_docs_path: str = Field(..., description="Volume folder with supporting documents.")
+    entity_name: str | None = Field(
+        default=None, examples=["IM Australia"],
+        description="Entity under audit — passed to the LLM as context for the analysis.",
+    )
+    scope_period_start: date | None = Field(
+        default=None, examples=["2024-01-01"],
+        description="Audit scope period start — passed to the LLM as context (the period under review).",
+    )
+    scope_period_end: date | None = Field(
+        default=None, examples=["2024-12-31"],
+        description="Audit scope period end — passed to the LLM as context (the period under review).",
+    )
     si_history_path: str | None = Field(
         default=None, description="Volume path to this auditor's SI History inputs.",
     )

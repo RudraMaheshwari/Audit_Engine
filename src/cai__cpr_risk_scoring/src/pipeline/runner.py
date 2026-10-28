@@ -379,13 +379,17 @@ def _ensure_supporting_docs_index(index_manager, settings, auditor_id: str) -> N
     auditor's documents are already embedded, ingestion is skipped so nothing is re-embedded. Only
     the current auditor's subfolder is ingested.
     """
+    # Re-ingest on change (same as the KB indexes): when the auditor already has data, each file's
+    # content hash is compared and only NEW or EDITED files are re-embedded (unchanged files skipped).
+    # A fresh/empty index is a full ingest. This replaces the old all-or-nothing skip, which missed
+    # files added or changed after the first ingest.
+    change_detect = index_manager.is_populated_for_auditor("supporting", auditor_id)
     index_manager.ensure_index("supporting")
-    if index_manager.is_populated_for_auditor("supporting", auditor_id):
+    if change_detect:
         logger.info(
-            "[Ingest] supporting_docs already embedded for auditor — skipping | auditor=%s",
+            "[Ingest] supporting_docs already populated — re-ingesting only changed/new files | auditor=%s",
             auditor_id,
         )
-        return
 
     auditor_volume = settings.resolved_supporting_docs_folder
     logger.info("[Ingest] Listing auditor supporting docs | volume=%s", auditor_volume)
@@ -426,6 +430,7 @@ def _ensure_supporting_docs_index(index_manager, settings, auditor_id: str) -> N
                     downloader=downloader,
                     tmp_dir=tmp_dir,
                     failures=download_failures,
+                    change_detect=change_detect,
                 ): f["name"]
                 for f in all_files
             }
@@ -1224,7 +1229,10 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
         tpi_inventory_block=tpi_inventory_block,
         transactional_context=transactional_context,
         recurrence_context=recurrence_context,
+        audit_context=settings.audit_scope_context,
     )
+    if settings.audit_scope_context:
+        logger.info("[Runner] Audit context injected | %s", settings.audit_scope_context)
 
     conflict_detector  = ConflictDetector(embeddings, settings)
     questionnaire_repo = DatabricksQuestionnaireRepository(settings, llm=llm)
@@ -1272,6 +1280,15 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
     completed_count   = 0
     lock              = asyncio.Lock()
     output_writer     = OutputWriter(OutputRepository(), settings)
+    # Register the auditor's actually-indexed supporting-doc names so the writer drops phantom
+    # Supporting-Evidence citations (a file cited by the LLM but never ingested). Best-effort /
+    # fail-open: if the lookup returns nothing, no filtering is applied.
+    try:
+        output_writer.set_valid_supporting_files(
+            index_manager.list_document_names("supporting", auditor_id)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Main] Could not list supporting doc names — phantom-citation filter off | %s", exc)
 
     async def process_question(question, idx: int):
         nonlocal completed_count

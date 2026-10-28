@@ -19,7 +19,6 @@ from .cpi.cpi_repository import CpiRepository
 from .deck.renderer import DeckRenderer
 from .deck.spec import DECK_SPEC, SAM_1_DECK_SPEC, SECTION_BREAK
 from .ingestion.questionnaire_index import QuestionnaireIndexManager
-from .ingestion.questionnaire_ingestor import QuestionnaireIngestor
 from .ingestion.supporting_docs_ingestor import SupportingDocsIngestor
 from .market_overview.context_retriever import MarketContextRetriever
 from .market_overview.generator import MarketOverviewGenerator
@@ -178,14 +177,34 @@ class ScopingDeckApp:
             logger.info("=== slide_1 skipped (--skip-ingest) ===")
             return
 
-        logger.info("=== slide_1: ingestion -> %s ===", self._config.full_questionnaire_index)
-        volume_path = _SAM_1_QUESTIONNAIRE_VOLUME if self._is_sam_1 else None
-        count = QuestionnaireIngestor(
-            self._config, self._index, volume_path=volume_path
-        ).ingest(force=force_ingest)
+        logger.info("=== slide_1: questionnaire index -> %s ===", self._config.full_questionnaire_index)
+        self._index.ensure_index()
+
+        # Risk Analysis (and the standalone ingest_questionnaire_index.py script) are the writers of
+        # the shared questionnaire index; the deck only READS it (market/business overview retrieval).
+        # The deck NEVER ingests here — ingesting duplicated every Q&A under a second chunk_id and
+        # bloated the shared endpoint toward its capacity limit. If the index has no rows for this
+        # auditor yet, the deck logs it and continues (overviews fall back to whatever context exists)
+        # rather than attempting an upsert that would fail on a full endpoint and kill the whole run.
+        auditor_id = self._config.settings.auditor_id
+        try:
+            populated = self._index.is_populated(auditor_id=auditor_id)
+        except Exception as exc:  # noqa: BLE001
+            populated = False
+            logger.warning("[Ingest] questionnaire is_populated probe failed — continuing | %s", exc)
+        if populated:
+            logger.info("[Ingest] questionnaire index populated — reusing | auditor=%s", auditor_id)
+        else:
+            logger.warning(
+                "[Ingest] questionnaire index has NO rows for auditor=%s — the deck does NOT ingest. "
+                "Populate it first via Risk Analysis or "
+                "`ingest_questionnaire_index.py --auditor %s ...`. Continuing with reduced context.",
+                auditor_id, auditor_id,
+            )
+
         SupportingDocsIngestor(self._config).ensure()
         PastReviewIngestor(self._config, self._past_review_index).ingest(force=force_ingest)
-        logger.info("=== slide_1 complete | chunks_upserted=%d ===", count)
+        logger.info("=== slide_1 complete | questionnaire reused (deck does not ingest) ===")
 
     def _build_past_review_tables(self) -> tuple[PastReviewTable, PastReviewTable]:
         empty = PastReviewTable(rows=(), year=None)

@@ -1,3 +1,5 @@
+import re
+
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.agent_toolkits.sql.base import create_sql_agent
 from langchain_community.utilities import SQLDatabase
@@ -6,6 +8,7 @@ from langchain_core.language_models import BaseChatModel
 from src.config.constants import (
     AGENT_TRANSACTIONAL,
     DASHBOARD_TABLE_DESCRIPTIONS,
+    DASHBOARD_WORKFLOW_NAMES,
     SQL_SAMPLE_ROWS_IN_TABLE_INFO,
     TRANSACTIONAL_SQL_MAX_ITERATIONS,
 )
@@ -60,7 +63,62 @@ class TransactionalDataAgent:
             handle_parsing_errors=True,
             max_iterations=TRANSACTIONAL_SQL_MAX_ITERATIONS,
             name=AGENT_TRANSACTIONAL,
+            return_intermediate_steps=True,  # expose executed SQL + results for deterministic calc evidence
         )
+
+    # ── Deterministic calc-evidence extraction from the agent's intermediate steps ───────
+    # The SQL toolkit's query tool is named "sql_db_query"; its tool_input carries the exact SQL the
+    # agent ran, and the observation is the result. Reading these is deterministic — it does NOT depend
+    # on the LLM echoing the query or table names correctly in its prose answer.
+    _SQL_TABLE_RE = re.compile(
+        r"\bfrom\s+([A-Za-z0-9_.`]+)|\bjoin\s+([A-Za-z0-9_.`]+)", re.IGNORECASE
+    )
+
+    @classmethod
+    def _tables_in_sql(cls, sql: str) -> list[str]:
+        """Dedicated workflow name(s) for the table(s) in the FROM/JOIN clauses — the SAME names the
+        transactional-analysis run uses (DASHBOARD_WORKFLOW_NAMES), so calc evidence is consistent.
+        Strips catalog/schema to the base table, maps to the dedicated name, order-preserving + unique."""
+        seen: list[str] = []
+        for m in cls._SQL_TABLE_RE.finditer(sql or ""):
+            raw = (m.group(1) or m.group(2) or "").strip("`").rstrip(";")
+            if not raw or raw.lower() in ("select", "("):
+                continue
+            base = raw.split(".")[-1].strip("`")
+            name = DASHBOARD_WORKFLOW_NAMES.get(base, base)
+            if name not in seen:
+                seen.append(name)
+        return seen
+
+    @classmethod
+    def extract_executed_sql(cls, result: dict) -> list[tuple[str, str]]:
+        """[(sql, result_text), …] for each query the agent actually executed (from intermediate_steps)."""
+        pairs: list[tuple[str, str]] = []
+        for step in (result or {}).get("intermediate_steps", []) or []:
+            try:
+                action, observation = step
+            except Exception:  # noqa: BLE001
+                continue
+            if getattr(action, "tool", "") != "sql_db_query":
+                continue
+            ti = getattr(action, "tool_input", "")
+            sql = (ti.get("query") if isinstance(ti, dict) else str(ti)).strip()
+            if sql:
+                pairs.append((sql, str(observation)))
+        return pairs
+
+    @classmethod
+    def build_exact_tables_block(cls, result: dict) -> str:
+        """Deterministic 'Tables & queries executed' block (exact FROM-clause table names + the SQL)."""
+        pairs = cls.extract_executed_sql(result)
+        if not pairs:
+            return ""
+        lines = ["Tables & queries executed (exact, from the SQL actually run):"]
+        for i, (sql, _res) in enumerate(pairs, 1):
+            tbls = ", ".join(cls._tables_in_sql(sql)) or "(none parsed)"
+            lines.append(f"[{i}] Tables: {tbls}")
+            lines.append(f"    SQL: {' '.join(sql.split())}")
+        return "\n".join(lines)
 
     @staticmethod
     def _patch_databricks_dialect() -> None:

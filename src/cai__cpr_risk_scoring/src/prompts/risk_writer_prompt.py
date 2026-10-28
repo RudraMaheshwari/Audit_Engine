@@ -130,6 +130,12 @@ escalation was not evidenced in the available records," and "based on the record
 confirm whether RWG review or approval occurred." Reserve "did not occur" for cases where current-year
 evidence directly shows the step itself did not happen.
 
+PROPOSED / FUTURE vs IMPLEMENTED: distinguish activity ALREADY carried out in the scope period from
+activity only PROPOSED or scheduled for the future. A request, plan, or presentation seeking future
+approval is NOT evidence that the activity was already performed without approval. Bound the finding to
+what the evidence shows was actually done in-period, and describe proposed/future items separately as
+proposed — never as confirmed past conduct.
+
 PRIOR OCCURRENCE (historical context, applies to Potential Risk and Further Review Required): if the
 provided context indicates the SAME issue was previously identified in a past audit report or in SI
 History / Legal inputs, add ONE closing sentence stating this as historical context and naming the
@@ -285,14 +291,15 @@ does not apply — explain instead why the item is an unresolved open item rathe
 
 Must:
 • State the category assigned (High Risk / Medium Risk / Low Risk / Not Applicable / No Risk).
-• For Potential Risk: explain the Impact judgement (the highest of the financial, legal/regulatory, or
-  reputational consequence) and the Likelihood judgement (strength and corroboration of the evidence)
-  that led to the category — expressed in words, not as a raw numeric score.
-• LIKELIHOOD / IMPACT WORDING MUST MATCH THE BAND: describe likelihood and impact with the word that
-  matches their scored level — 1-2 = "low", 3 = "moderate", 4-5 = "high". Never call likelihood (or
-  impact) "high" for a Medium or Low Risk item, or where the scored value is 3 or below. Keep the
-  narrative strength consistent with the assigned Risk Category and with the Likelihood/Impact values —
-  the words in the narrative must not contradict the numeric Likelihood/Impact.
+• For Potential Risk: explain WHAT DRIVES the Impact (the financial, legal/regulatory, or reputational
+  consequence at stake) and WHAT DRIVES the Likelihood (the strength and corroboration of the evidence)
+  that led to the category — describe the drivers, not a raw numeric score.
+• DO NOT attach a magnitude adjective (high / medium / moderate / low) to the words "likelihood" or
+  "impact" anywhere in the prose. Refer to them plainly — e.g. "the impact reflects legal/regulatory
+  exposure"; "the likelihood reflects corroborated transaction-level evidence". The magnitude is
+  carried ONLY by the numeric Likelihood/Impact scores and the Risk Category band, so the wording can
+  never contradict the score. Stating the Risk Category itself ("High/Medium/Low Risk category
+  assigned") is expected; qualifying likelihood or impact with high/medium/low is not.
 • For Further Review Required ("Not Applicable"): state that the concern is a credible but unconfirmed
   scope-period indicator that cannot yet be scored, so it is carried as an open item for further review and
   is deliberately left uncategorised — do NOT assign or imply a severity band.
@@ -311,8 +318,8 @@ evidence places this in the High Risk category."
 
 For Medium Risk (Potential Risk):
 "Medium Risk category assigned. A confirmed scope-period deviation exists with a contained
-financial/regulatory consequence, and the corroborating evidence is credible. The moderate impact and
-likelihood place this in the Medium Risk band."
+financial/regulatory consequence, and the corroborating evidence is credible. The contained consequence
+and the corroborated evidence place this in the Medium Risk band."
 
 For Not Applicable (Further Review Required):
 "Not Applicable — Further Review Required. A specific, credible scope-period indicator exists but
@@ -377,8 +384,10 @@ policy CONTENT (e.g. "10 Third-party Intermediary Risk Management"). Page No. = 
   Source: [source]; File Name: [exact file name]; Section: [section heading]; Page No.: [page number]
 • Global Scope-Area Policy document:
   Source: [source]; File Name: [exact file name]; Section: [section heading]; Page No.: [page number]
-• Supporting Evidence (File Name only):
+• Supporting Evidence (an ingested supporting DOCUMENT / file only — File Name only):
   Source: [source]; File Name: [exact file name]
+• Transactional dashboard data (a dashboard / NL-to-SQL query result — NOT a document):
+  Source: Transactional Dashboard; File Name: [exact dashboard table name(s) queried]
 
 Examples:
 • Source: HCBI Guide (Global Policy); File Name: TV-POL-02257_v3.0.pdf; Section: 10 Third-party Intermediary Risk Management; Page No.: 24
@@ -400,6 +409,11 @@ DOCUMENT REFERENCE RULES — apply strictly:
   or name that appears only in the questionnaire response or a supporting document.
 • Use the exact filename shown in the provided context. Do not invent or estimate a filename.
 • Do not cite a document unless it was actually used in the assessment.
+• TRANSACTIONAL DATA IS NOT "SUPPORTING EVIDENCE": when a point is backed by dashboard / NL-to-SQL
+  query data, cite it as "Source: Transactional Dashboard" naming the EXACT dashboard table(s) used —
+  NEVER label a dashboard or table as "Supporting Evidence". "Supporting Evidence" is reserved for an
+  ingested supporting DOCUMENT (a file); only cite a Supporting Evidence file that is actually among the
+  retrieved evidence for this auditor — never one that merely appears named in the response.
 • DE-DUPLICATE SOURCES: list each unique source entry ONCE. When the same document (same File Name,
   and same Section/Page where shown) supports more than one point, cite it a SINGLE time — never
   repeat an identical source line.

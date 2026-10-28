@@ -1382,7 +1382,7 @@ class TransactionalDataAnalysisAgent:
                 continue
             sql = self._apply_limit(sql, 25)  # hard safety cap on computed rows
             executed_sql = sql
-            # Friendly workflow name of the table this calculation runs against (shown per calc block).
+            # Dedicated workflow name of the table this calculation runs against (shown per calc block).
             table_disp = self._workflow_display(self._extract_table_from_sql(sql)) or "Not Available"
             try:
                 rows = self._run_sql(sql)

@@ -240,6 +240,28 @@ class Settings(BaseSettings):
     current_scope_id: str = "fcpa_all_scopes"
     total_scope_areas: int = 48
 
+    # Audit identity passed per run as CONTEXT for the LLM (so analysis knows WHICH entity and WHICH
+    # period it is reviewing). All optional — blank values are simply omitted from the context line.
+    # scope_period_* are ISO date strings (YYYY-MM-DD) set from the Risk Analysis request.
+    entity_name: str = ""
+    scope_period_start: str = ""
+    scope_period_end: str = ""
+
+    @property
+    def audit_scope_context(self) -> str:
+        """One-line audit-context preamble for the per-question analysis, or '' when nothing is set."""
+        bits: list[str] = []
+        if self.entity_name:
+            bits.append(f"Entity under audit: {self.entity_name}.")
+        if self.scope_period_start and self.scope_period_end:
+            bits.append(f"Audit scope period: {self.scope_period_start} to {self.scope_period_end} "
+                        f"(the past period under review — all analysis concerns THIS period).")
+        elif self.scope_period_start:
+            bits.append(f"Audit scope period starts {self.scope_period_start}.")
+        elif self.scope_period_end:
+            bits.append(f"Audit scope period ends {self.scope_period_end}.")
+        return ("AUDIT CONTEXT: " + " ".join(bits)) if bits else ""
+
     # Audit local currency FALLBACK only. The primary value is resolved AT RUNTIME from the data
     # (most common non-USD currency code for the engagement — i.e. where the audit runs). This default
     # is used solely when no currency column/value can be found. Used by the per-scope summary sheet.

@@ -127,6 +127,12 @@ DATA COMPLETENESS DISCIPLINE (a NULL / blank / zero KEY field is a DATA-QUALITY 
     generic-vendor population and classify recipients from the data per the ONE_TIME_VENDOR POPULATION
     note in the data dictionary — do NOT quote a whole-AP-ledger count/total, and frame repeated use as a
     risk to investigate / a need for standard onboarding, not a confirmed violation of every payment.
+    EXCLUDE (or segment out) intercompany / J&J-affiliate payees and statutory/regulator payees so they
+    do not inflate the one-time-vendor total — match name VARIANTS, not a single spelling: J&J affiliates
+    include JOHNSON & JOHNSON / JOHNSON&JOHNSON (with OR without spaces) / J&J / JNJ / JANSSEN* / Cilag /
+    Ethicon; statutory/regulator payees include customs (세관), the tax authority (국세청 / National Tax
+    Service) and similar government collectors. Report any excluded intercompany/statutory volume
+    separately, never inside the one-time-vendor risk total.
   * a vendor-master "blocked" / "inactive" flag reflects status AT EXTRACTION, not necessarily at the
     payment date. Do NOT conclude a payment was made to a blocked/inactive vendor unless the status is
     established as of the payment date; otherwise state the point-in-time status as unconfirmed.
@@ -161,9 +167,16 @@ CALCULATION DISCIPLINE:
   table info — never invent a category string. If the data summary lists `Fee for Service`,
   `Event Invitee`, `Advisory Board`, match the scope to those real values; do not filter on a guessed
   term like `Congress`/`FFS` that may not exist in the column.
-• RELEVANCE ORDERING: every query is capped at LIMIT 25. ORDER BY the most risk-relevant/material
-  dimension DESC (e.g. largest amount, most breaches, highest ratio, most days late) BEFORE the LIMIT,
-  so the 25 retained rows are the most relevant and truncation never drops the important ones.
+• RELEVANCE ORDERING: the per-group breakdown query is capped at LIMIT 25. ORDER BY the most risk-
+  relevant/material dimension DESC (e.g. largest amount, most breaches, highest ratio, most days late)
+  BEFORE the LIMIT, so the 25 retained rows are the most relevant and truncation never drops the
+  important ones.
+• POPULATION TOTALS ARE FULL-POPULATION, NOT TOP-N: the subtotal of a LIMIT-25 breakdown is NOT the
+  population total. Whenever you report a headline transaction count and USD amount for a population,
+  compute them with a SEPARATE aggregate query over the WHOLE filtered population (COUNT(*) and SUM(...)
+  with NO LIMIT and no GROUP-BY truncation) and report THOSE as the total. Keep the ordered LIMIT-25
+  query ONLY as the illustrative top-25 breakdown and label it as such — never sum the 25 shown rows and
+  present that figure as the total.
 • When a population mixes distinct activity/expense types, GROUP BY that type so each type gets its
   own count and total — do not blend different types into one aggregate.
 • When a policy threshold is expressed in a local currency, compare against the LOCAL / document-
@@ -181,7 +194,9 @@ SQL TYPE SAFETY (critical — numeric columns are often stored as STRING):
 - Columns are shown as `name` (TYPE). Wrap any numeric column used in SUM/compare/ORDER BY in
   try_cast(`col` AS DOUBLE). Never compare a STRING column directly to a number; never
   COALESCE(`string_col`, 0) — use COALESCE(try_cast(`col` AS DOUBLE), 0).
-- Every query MUST end with LIMIT 25 (these are summary metrics, not raw dumps).
+- Every per-group breakdown query MUST end with LIMIT 25 (these are summary metrics, not raw dumps).
+  EXCEPTION: the single full-population aggregate (COUNT/SUM with no GROUP BY, or grouped only by date)
+  that yields the population total needs no LIMIT — it already collapses to one/few rows.
 - Use ONLY the exact table and column names provided.
 - When computing discount%, override, or margin metrics, add WHERE clauses that EXCLUDE free goods,
   samples, compassionate supply, donations, and credit memos/returns, and (for overrides) filter on

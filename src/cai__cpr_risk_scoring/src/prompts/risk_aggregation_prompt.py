@@ -111,10 +111,12 @@ RISK SCORING (Impact x Likelihood — assign for the CONSOLIDATED risk, evaluati
   the source finding ONLY when MULTIPLE findings corroborate the same risk.
 - Return likelihood and impact as integers 1-5. Do not compute the category yourself; it is derived
   from the matrix downstream.
-- WORDING MUST MATCH THE NUMBER: any likelihood/impact strength word you use in risk_rationale or
-  risk_description MUST match the integer you return — 1-2 = "low", 3 = "moderate", 4-5 = "high". Never
-  describe likelihood (or impact) as "high" unless you returned 4 or 5 for it; if you returned 3, say
-  "moderate". The narrative must not contradict the numeric Likelihood/Impact.
+- NO MAGNITUDE WORD ON LIKELIHOOD/IMPACT: do NOT attach a magnitude adjective (high / medium / moderate
+  / low) to the words "likelihood" or "impact" in risk_rationale or risk_description. Refer to them
+  plainly and describe their DRIVERS instead (consequence at stake; strength/corroboration of evidence).
+  The magnitude is carried only by the integer Likelihood/Impact you return and the Risk Category band,
+  so the wording can never contradict the number. Naming the Risk Category ("High/Medium/Low Risk") is
+  fine; qualifying likelihood or impact itself with high/medium/low is not.
 
 CONFIDENCE
 - confidence: a number from 0.0 to 1.0 stating how confident YOU are in this consolidated risk and

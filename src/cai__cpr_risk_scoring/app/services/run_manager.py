@@ -95,6 +95,18 @@ class RunManager:
             if value:
                 os.environ[env_var] = value
 
+        # Audit identity passed as LLM context (Risk Analysis). Field names match the Settings fields,
+        # so these env vars populate settings.entity_name / scope_period_start / scope_period_end.
+        _entity = getattr(request, "entity_name", None)
+        if _entity:
+            os.environ["ENTITY_NAME"] = str(_entity)
+        for value, env_var in (
+            (getattr(request, "scope_period_start", None), "SCOPE_PERIOD_START"),
+            (getattr(request, "scope_period_end", None), "SCOPE_PERIOD_END"),
+        ):
+            if value:
+                os.environ[env_var] = value.isoformat() if hasattr(value, "isoformat") else str(value)
+
         # Scoping AI + Scoping Deck inputs (present only on their request subclasses — getattr-safe).
         # These configs read env, so the factory maps the request onto the env vars they expect.
         def _g(name):

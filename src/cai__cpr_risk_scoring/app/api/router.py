@@ -25,7 +25,12 @@ def build_api_router() -> APIRouter:
     # infra liveness/readiness probes hit the pod directly, independent of the external mount.
     api_prefix = f"{settings.normalized_base_path}{settings.api_prefix}"
     router = APIRouter()
+    # Health is served at the root (/health) for infra liveness/readiness probes AND under the external
+    # base path (e.g. /cpr/risk-analysis/health) for callers reaching the service through the mount. The
+    # guard avoids registering /health twice when the prefix is empty.
     router.include_router(health.router)
+    if api_prefix:
+        router.include_router(health.router, prefix=api_prefix)
     router.include_router(admin_router.router, prefix=api_prefix)
     router.include_router(supporting_router.router, prefix=api_prefix)
 

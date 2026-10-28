@@ -463,6 +463,31 @@ class VectorIndexManager:
             )
             return False
 
+    def list_document_names(self, index_key: str, auditor_folder: str) -> set[str]:
+        """Distinct document_name values held for an auditor — used to verify that a cited supporting
+        file actually exists before it lands in the output. Empty set on any error (caller fails open)."""
+        try:
+            index = self._client.get_index(
+                endpoint_name=self._settings.databricks_vector_search_endpoint,
+                index_name=self._index_names[index_key],
+            )
+            epsilon_vector = [_PROBE_EPSILON] * self._settings.embedding_dimensions
+            results = index.similarity_search(
+                columns=["document_name"],
+                query_vector=epsilon_vector,
+                filters={"auditor_folder": auditor_folder},
+                num_results=10000,  # index hard cap; projected column keeps the payload small
+            )
+            rows = results.get("result", {}).get("data_array", []) or []
+            names = {str(r[0]).strip() for r in rows if r and r[0]}
+            logger.info("[VectorIndex] list_document_names | index=%s | auditor=%s | files=%d",
+                        index_key, auditor_folder, len(names))
+            return names
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[VectorIndex] list_document_names failed — returning empty | index=%s | "
+                           "auditor=%s | error=%s", index_key, auditor_folder, exc)
+            return set()
+
     def is_populated_for_auditor(self, index_key: str, auditor_folder: str) -> bool:
         """Check whether an index already holds data for a specific auditor_folder."""
         try:

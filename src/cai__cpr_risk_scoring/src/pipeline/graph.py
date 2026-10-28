@@ -27,6 +27,7 @@ def build_audit_graph(
     tpi_inventory_block: str = "",
     transactional_context: str = "",
     recurrence_context: str = "",
+    audit_context: str = "",
 ) -> AuditSupervisor:
     logger.info("[Graph] Building audit graph with 8 agents (scope_identifier + classifier + writer)")
     return AuditSupervisor(
@@ -42,4 +43,5 @@ def build_audit_graph(
         tpi_inventory_block=tpi_inventory_block,
         transactional_context=transactional_context,
         recurrence_context=recurrence_context,
+        audit_context=audit_context,
     )
