@@ -45,6 +45,30 @@ _LONG_T_RE = re.compile(r"(<t\b[^>]*>)(.*?)(</t>)", re.DOTALL)
 # never cuts through an entity and produces malformed XML.
 _DANGLING_ENTITY_RE = re.compile(r"&[^;]{0,8}$")
 
+# An EMPTY run-properties block: <rPr/> or <rPr></rPr> — a run that declares formatting but carries
+# none. openpyxl (3.1.x) can emit this for a plain segment inside a CellRichText; Excel flags it under
+# "Repaired Records: String properties from /xl/worksheets/sheetN.xml" and strips the run. We drop the
+# empty block so the run becomes a clean property-less run.
+_EMPTY_RPR_RE = re.compile(r"<rPr\s*/>|<rPr>\s*</rPr>")
+
+# A <t …>CONTENT</t> text element (groups: open-tag, attrs, '>', content, close). Used to add
+# xml:space="preserve" when the run text has leading/trailing whitespace or a newline but the attribute
+# is missing — without it Excel treats the run's string property as invalid (the exact "String
+# properties" repair on inline rich text) and discards it. _apply_bold splits bullets at every bold
+# boundary, so the plain segments frequently carry boundary spaces.
+_T_ELEM_RE = re.compile(r"(<t)(\b[^>]*?)(>)(.*?)(</t>)", re.DOTALL)
+
+
+def _ensure_preserve_space(text: str) -> str:
+    """Add xml:space="preserve" to any <t> whose content has leading/trailing whitespace or a newline
+    and lacks the attribute. Idempotent; leaves whitespace-free runs and already-preserved runs alone."""
+    def _fix(match: "re.Match") -> str:
+        attrs, inner = match.group(2), match.group(4)
+        if (inner.strip() != inner or "\n" in inner or "\r" in inner) and "xml:space" not in attrs:
+            attrs = f'{attrs} xml:space="preserve"'
+        return f"{match.group(1)}{attrs}{match.group(3)}{inner}{match.group(5)}"
+    return _T_ELEM_RE.sub(_fix, text)
+
 
 def _truncate_long_runs(text: str) -> str:
     """Truncate the CONTENT of any <t>…</t> run longer than EXCEL_CELL_LIMIT (entity-safe), so an
@@ -84,8 +108,14 @@ _EMPTY_A_RUN_RE = re.compile(
 
 
 def _clean_xlsx_part(text: str) -> str:
-    """xlsx worksheet / sharedStrings: strip illegal chars, drop empty runs, truncate over-length runs."""
-    return _truncate_long_runs(_EMPTY_RUN_RE.sub("", _ILLEGAL_XML_RE.sub("", text)))
+    """xlsx worksheet / sharedStrings: the full fix set for the "Repaired Records: String properties"
+    prompt on inline rich text — strip illegal chars, drop empty runs AND empty run-property blocks,
+    add xml:space to whitespace-bearing runs, then truncate over-length runs."""
+    text = _ILLEGAL_XML_RE.sub("", text)
+    text = _EMPTY_RUN_RE.sub("", text)
+    text = _EMPTY_RPR_RE.sub("", text)
+    text = _ensure_preserve_space(text)
+    return _truncate_long_runs(text)
 
 
 def _clean_pptx_part(text: str) -> str:

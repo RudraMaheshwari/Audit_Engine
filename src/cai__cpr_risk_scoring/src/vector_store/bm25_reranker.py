@@ -52,13 +52,17 @@ class BM25Reranker:
         )
         sem_rank = {idx: rank for rank, idx in enumerate(sem_order)}
 
-        # BM25 rank — higher score = better rank (rank 0 = best)
-        bm25_order = sorted(
-            range(len(chunks)),
-            key=lambda i: bm25_scores[i],
-            reverse=True,
-        )
+        # BM25 rank — higher score = better rank (rank 0 = best). A chunk with ZERO BM25 score has no
+        # lexical overlap with the query, which is NOT evidence of irrelevance — e.g. a non-English
+        # (Korean) supporting record cannot lexically match an English query, yet it may be the actual
+        # evidence. Ranking such a chunk dead-last on BM25 evicted it from the final top_k even when
+        # semantic search ranked it highly. So rank only the chunks that DID match lexically; a
+        # zero-overlap chunk inherits its SEMANTIC rank (judge it on semantics alone, never punished).
+        matched = [i for i in range(len(chunks)) if bm25_scores[i] > 0.0]
+        bm25_order = sorted(matched, key=lambda i: bm25_scores[i], reverse=True)
         bm25_rank = {idx: rank for rank, idx in enumerate(bm25_order)}
+        for i in range(len(chunks)):
+            bm25_rank.setdefault(i, sem_rank[i])
 
         rrf_scores = [
             1.0 / (_RRF_K + sem_rank[i]) + 1.0 / (_RRF_K + bm25_rank[i])
@@ -69,7 +73,7 @@ class BM25Reranker:
         result = [chunks[i] for i in ranked[:top_k]]
 
         logger.debug(
-            "[BM25Reranker] Reranked %d → %d | top_rrf=%.4f | query='%s'",
-            len(chunks), top_k, rrf_scores[ranked[0]] if ranked else 0.0, query[:60],
+            "[BM25Reranker] Reranked %d → %d | top_rrf=%.4f | lexical_matches=%d | query='%s'",
+            len(chunks), top_k, rrf_scores[ranked[0]] if ranked else 0.0, len(matched), query[:60],
         )
         return result

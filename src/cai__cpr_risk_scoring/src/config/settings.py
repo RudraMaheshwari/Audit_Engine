@@ -2,10 +2,11 @@ from functools import lru_cache
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# The 7 dashboards analysed by default (the SAM audit set). Additional dashboards are registered in
-# all_dashboard_table_names and enabled per audit via the ACTIVE_DASHBOARDS env var.
+# Dashboards analysed by default. Additional dashboards are registered in all_dashboard_table_names and
+# can be overridden per audit via the ACTIVE_DASHBOARDS env var.
 _DEFAULT_ACTIVE_DASHBOARDS = (
     "disbursement", "payment", "hcc", "otc", "pricing", "revenue", "travel_expense",
+    "hcc_full", "hcc_attendee", "travel_expense_attendee",
 )
 
 
@@ -56,6 +57,10 @@ class Settings(BaseSettings):
         "/Volumes/nbod_gaagd/risk_analysis_output/scoping_deck"
     )
     databricks_transactional_schema: str = "cpr__gld"
+    # Scratch schema (in databricks_catalog) where Phase 3 stages supporting-doc tabular data (tender
+    # list, PSP list, TPI inventory, …) as TEMPORARY SQL tables for scope calculations, then drops them
+    # at the end of Phase 3. The service principal must have CREATE/DROP TABLE here.
+    databricks_scratch_schema: str = "cpr_scratch"
     databricks_vector_search_endpoint: str = "cpr_risk_analysis"
     databricks_warehouse_id: str
 
@@ -67,6 +72,10 @@ class Settings(BaseSettings):
     # Global scope-area policy index (formerly "tpi_due_diligence_index").
     policy_index_name: str = "global_scope_area_policies"
     supporting_docs_index_name: str = "auditor_supporting_docs_index"
+    # Optional per-run suffix appended to EVERY vector-index name (not source tables/volumes). Lets a
+    # run create uniquely-named indexes on a fresh endpoint without UC name collisions. Empty = normal
+    # shared indexes. Set via INDEX_NAME_SUFFIX for an isolated run, then revert to "".
+    index_name_suffix: str = ""
     fcpa_scope_policy_index_name: str = "fcpa_scope_policy_index"
 
     # Knowledge-base indexes (scoped per auditor via auditor_id metadata)
@@ -318,6 +327,11 @@ class Settings(BaseSettings):
         return v
 
     # ── Computed properties (fully-qualified table names) ─────────────────────
+
+    @property
+    def scratch_schema_fqn(self) -> str:
+        """`catalog.scratch_schema` where Phase 3 stages supporting-doc temp tables."""
+        return f"{self.databricks_catalog}.{self.databricks_scratch_schema}"
 
     @property
     def full_payments_table(self) -> str:

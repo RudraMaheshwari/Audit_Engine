@@ -1,6 +1,6 @@
 """Prompt for the Risk Aggregation Agent — clusters raw findings into unique risks."""
 
-from src.prompts.guardrails import US_ENGLISH
+from src.prompts.guardrails import FACT_CONSISTENCY, US_ENGLISH
 
 AGGREGATION_SYSTEM_PROMPT = """\
 You are the Risk Aggregation Agent for J&J's CA&I FCPA audit program.
@@ -13,10 +13,22 @@ CLUSTERING RULES
 - Group findings that describe the SAME underlying risk or control gap into ONE risk, even when they
   come from different questions AND from the transactional data. Example: an "incorrect GL account
   code" issue appearing in several responses and in the payments data is ONE risk, not many.
-- Each consolidated risk belongs to exactly ONE scope area (choose the most specific applicable one
-  from the finding's scope areas). DISTINCT scope areas stay SEPARATE risks even when they share
-  recipients or evidence — e.g. Sponsorships, Patient Advocacy, and Product Training are separate scope
-  areas and must NOT be merged into one risk, and risk_type must NOT name several scope areas at once.
+- MERGE ON SUBSTANCE, NOT LABELS: group two findings ONLY when they evidence the SAME underlying
+  control failure. Do NOT merge just because their risk_type wording, scope label, or keywords overlap.
+  Findings about DIFFERENT control activities are SEPARATE risks even under the same scope area — e.g.
+  "distributor sell-out monitoring not performed" vs "TPI-submitted documentation not provided" are two
+  different control failures and must stay as two risks, not be flattened into one "Due Diligence
+  documentation gaps" row because both touch TPIs/distributors.
+- Each consolidated risk belongs to exactly ONE scope area. DISTINCT scope areas stay SEPARATE risks
+  even when they share recipients or evidence — e.g. Sponsorships, Patient Advocacy, and Product
+  Training are separate scope areas and must NOT be merged into one risk, and risk_type must NOT name
+  several scope areas at once.
+- MULTI-SCOPE FINDING → SPLIT, DO NOT COLLAPSE: when a SINGLE finding is tagged with several DISTINCT
+  scope areas reflecting DIFFERENT control concerns (e.g. a finding scoped to "Due Diligence; FCPA
+  Training; Product Promotion via Third Party Intermediaries"), do NOT fold it into just the most-
+  specific scope — emit a SEPARATE risk for EACH distinct scope-area concern the finding genuinely
+  evidences, partitioning its bullets/sources/questions to the matching one. Collapse to a single scope
+  ONLY when the other tagged scopes are not actually evidenced by the finding (incidental tags).
 - "risk_type" is a SHORT descriptive phrase naming ONE risk (e.g. "Use of incorrect GL Account code").
   It is NOT the words "Potential Risk"/"Further Review".
 - One cluster = ONE risk type. A shared scope area does NOT mean one row: when two DISTINCT risk types
@@ -142,7 +154,7 @@ OUTPUT — valid JSON only, no markdown, no prose:
     }}
   ]
 }}
-""" + US_ENGLISH
+""" + FACT_CONSISTENCY + US_ENGLISH
 
 AGGREGATION_USER_TEMPLATE = """\
 RAW FINDINGS TO CLUSTER (each line: [source_ref] scope | category | description):

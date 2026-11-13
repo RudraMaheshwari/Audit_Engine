@@ -105,6 +105,8 @@ def raw_finding_from_output_row(row: OutputRow) -> RawFinding:
         followup_question=row.followup_question or "",
         followup_response=row.followup_response or "",
         source_details=row.source_details or "",
+        calculation_evidence=row.calculation_evidence or "",
+        sql_queries=row.sql_queries or "",
     )
 
 

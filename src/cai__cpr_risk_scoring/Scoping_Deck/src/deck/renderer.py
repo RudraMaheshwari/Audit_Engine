@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 
 from pptx import Presentation
@@ -159,15 +160,18 @@ class DeckRenderer:
     def _paginated_slides(
         self, spec: SlideSpec, content: dict
     ) -> list[tuple[SlideSpec, dict]]:
-        """Split a slide with a DataTableField into multiple pages if row count exceeds the limit.
+        """Split a slide with a paginating table into multiple pages if its rows exceed the limit.
 
-        Returns a list of (SlideSpec, content_override) pairs. When no pagination is needed the
-        original spec and content are returned as a single-element list.
+        Handles both DataTableField (fixed multi-column) and DynamicTableField (2-column topic/body,
+        e.g. the Prior CPR/GACS assessment slide). Returns a list of (SlideSpec, content_override)
+        pairs. When no pagination is needed the original spec and content are returned as a
+        single-element list.
         """
-        # Find the first DataTableField with pagination enabled.
-        paginated_field: DataTableField | None = None
+        # Find the first table field with pagination enabled.
+        paginated_field = None
         for field in spec.fields:
-            if isinstance(field, DataTableField) and field.max_rows_per_slide > 0:
+            if (isinstance(field, (DataTableField, DynamicTableField))
+                    and getattr(field, "max_rows_per_slide", 0) > 0):
                 paginated_field = field
                 break
 
@@ -179,11 +183,25 @@ class DeckRenderer:
         if not all_rows:
             return [(spec, content)]
 
-        # Content-aware pagination: a row with a long Comments cell is much taller than a short one,
-        # so splitting purely on row count overflows the slide. Estimate each row's rendered line
+        # Per-field geometry: DataTableField carries explicit col_widths + cell_size; a
+        # DynamicTableField is a 2-column (topic, body) table sized from topic_col_width/width.
+        if isinstance(paginated_field, DynamicTableField):
+            col_widths: tuple[float, ...] = (
+                paginated_field.topic_col_width,
+                paginated_field.width - paginated_field.topic_col_width,
+            )
+            cell_size = paginated_field.content_size
+        else:
+            col_widths = paginated_field.col_widths
+            cell_size = paginated_field.cell_size
+
+        # Content-aware pagination: a row with a long Comments/body cell is much taller than a short
+        # one, so splitting purely on row count overflows the slide. Estimate each row's rendered line
         # count from its cell text + column widths and pack rows until the table's vertical budget
         # (or the max-rows cap) is reached.
-        chunks = self._pack_rows_by_height(all_rows, paginated_field)
+        chunks = self._pack_rows_by_height(
+            all_rows, col_widths, cell_size, paginated_field.height, max_per
+        )
         total_pages = len(chunks)
         if total_pages <= 1:
             return [(spec, content)]
@@ -194,17 +212,29 @@ class DeckRenderer:
                 # Add " (cont.)" suffix to title on continuation slides; update the
                 # title field's text_template in the spec for page 2+.
                 if page_idx > 1:
+                    # Does the title + " (cont.)" overflow one line? (~44 chars fits the title box at the
+                    # heading font.) If so, drop " (cont.)" onto a SECOND line and nudge this page's table
+                    # down so it doesn't collide — applied ONLY to this continuation slide, so the normal
+                    # slide keeps its tight title→table spacing. Short titles just get the inline suffix.
+                    title_field = next(
+                        (f for f in spec.fields
+                         if isinstance(f, FieldSpec) and f.kind is FieldKind.TITLE),
+                        None,
+                    )
+                    wrap_needed = bool(title_field) and len(title_field.text_template + " (cont.)") > 44
                     new_fields = []
                     for f in spec.fields:
                         if isinstance(f, FieldSpec) and f.kind is FieldKind.TITLE:
-                            # Append " (cont.)" to the title template.
-                            new_fields.append(FieldSpec(
-                                kind=f.kind, font_name=f.font_name, font_size=f.font_size,
-                                color_hex=f.color_hex, bold=f.bold, left=f.left, top=f.top,
-                                width=f.width, height=f.height,
-                                text_template=f.text_template + " (cont.)",
-                                content_key=f.content_key, bullets=f.bullets, align=f.align,
-                                skip_if_empty=f.skip_if_empty,
+                            if wrap_needed:
+                                new_fields.append(replace(
+                                    f, text_template=f.text_template + "\n(cont.)",
+                                    height=max(f.height, 1.5), wrap_title=True,
+                                ))
+                            else:
+                                new_fields.append(replace(f, text_template=f.text_template + " (cont.)"))
+                        elif wrap_needed and getattr(f, "kind", None) is FieldKind.DYNAMIC_TABLE:
+                            new_fields.append(replace(
+                                f, top=f.top + 0.65, height=max(1.0, f.height - 0.65),
                             ))
                         else:
                             new_fields.append(f)
@@ -300,17 +330,19 @@ class DeckRenderer:
         return pieces
 
     @classmethod
-    def _pack_rows_by_height(cls, all_rows: list, field: DataTableField) -> list[list]:
+    def _pack_rows_by_height(
+        cls, all_rows: list, col_widths: tuple[float, ...], cell_size: int, height: float, max_rows: int
+    ) -> list[list]:
         """Flow rows into pages by estimated rendered height.
 
         Small scopes pack together to fill a slide; a scope whose Comments overflow a whole slide is
         split across consecutive slides (continuation rows) rather than getting a lonely, half-empty
-        slide of its own.
+        slide of its own. Works for any 2-/multi-column table given its column widths + cell font size.
         """
-        line_height_in = (field.cell_size * cls._LINE_HEIGHT_FACTOR) / 72.0
-        usable_in = max(line_height_in, field.height - cls._HEADER_HEIGHT_IN)
+        line_height_in = (cell_size * cls._LINE_HEIGHT_FACTOR) / 72.0
+        usable_in = max(line_height_in, height - cls._HEADER_HEIGHT_IN)
         budget = max(1, int(usable_in / line_height_in))
-        cap = field.max_rows_per_slide or len(all_rows)
+        cap = max_rows or len(all_rows)
 
         pages: list[list] = []
         current: list = []
@@ -323,7 +355,7 @@ class DeckRenderer:
                 current, used = [], 0
 
         for row in all_rows:
-            row_lines = cls._row_lines(row, field.col_widths)
+            row_lines = cls._row_lines(row, col_widths)
 
             if row_lines <= budget:
                 # Each row also costs top+bottom cell padding — count it so several rows don't overflow.
@@ -340,14 +372,14 @@ class DeckRenderer:
             if first_budget < budget // 3:        # too little room left — start the big row fresh
                 flush()
                 first_budget = budget
-            pieces = cls._split_tall_row(row, field.col_widths, budget, first_budget)
+            pieces = cls._split_tall_row(row, col_widths, budget, first_budget)
             for idx, piece in enumerate(pieces):
                 current.append(piece)
                 if idx < len(pieces) - 1:
                     flush()                        # every piece but the last fills its own slide
                 else:
                     # last piece can accept more rows — include its per-row overhead too
-                    used = cls._row_lines(piece, field.col_widths) + cls._ROW_OVERHEAD_LINES
+                    used = cls._row_lines(piece, col_widths) + cls._ROW_OVERHEAD_LINES
 
         if current:
             pages.append(current)
@@ -602,16 +634,18 @@ class DeckRenderer:
 
     def _render_title(self, slide, field: FieldSpec, context: dict) -> None:
         text_frame = self._add_textbox(slide, field.left, field.top, field.width, field.height)
-        # Titles must never wrap: keep the full heading on one line at its given size (business-fixed),
-        # matching the wireframe. Text extends as needed rather than dropping to a clipped second line.
-        text_frame.word_wrap = False
+        # Titles stay on one line by default (business-fixed, matches the wireframe). A long heading can
+        # carry an explicit '\n' (the continuation-slide " (cont.)" suffix) to drop text to a second line
+        # inside the box instead of running off the right edge — rendered as separate paragraphs here.
+        text_frame.word_wrap = bool(getattr(field, "wrap_title", False))
         title = field.text_template.format(**context).replace("_", " ")
-        paragraph = text_frame.paragraphs[0]
-        paragraph.space_before = Pt(0)
-        paragraph.space_after = Pt(12)
-        run = paragraph.add_run()
-        run.text = _safe(title)
-        self._apply_font(run, field)
+        for index, line in enumerate(title.split("\n")):
+            paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+            paragraph.space_before = Pt(0)
+            paragraph.space_after = Pt(0)   # keep multi-line titles compact so "(cont.)" clears the table
+            run = paragraph.add_run()
+            run.text = _safe(line)
+            self._apply_font(run, field)
 
     # Body auto-fit tuning — shrink long body text so it never overflows its box.
     _BODY_MIN_SCALE = 0.55           # never shrink body text below 55% of its spec size

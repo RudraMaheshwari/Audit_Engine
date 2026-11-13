@@ -3,6 +3,7 @@ import re
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.agent_toolkits.sql.base import create_sql_agent
 from langchain_community.utilities import SQLDatabase
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 
 from src.config.constants import (
@@ -19,6 +20,63 @@ from src.prompts.transactional_data_prompt import SQL_PREFIX_TEMPLATE
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class SqlQueryCaptureHandler(BaseCallbackHandler):
+    """Captures the EXACT SQL executed by the SQL toolkit's `sql_db_query` tool during ONE agent run.
+
+    Version-robust: relies only on the stable on_tool_start / on_tool_end callbacks, so it captures the
+    executed SQL even when create_sql_agent does NOT forward `return_intermediate_steps` to the
+    AgentExecutor (which is version-dependent). Use a FRESH instance per invocation, passed via
+    `config={"callbacks": [handler]}`, then read `handler.calls` — a list of (sql, result_text) tuples
+    in execution order. Never raises into the agent run (a throwing callback can abort the agent)."""
+
+    _QUERY_TOOL = "sql_db_query"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._pending: dict[str, str] = {}   # run_id -> sql, paired with its result on tool-end
+
+    @staticmethod
+    def _tool_name(serialized) -> str:
+        if not isinstance(serialized, dict):
+            return ""
+        name = serialized.get("name")
+        if name:
+            return str(name)
+        ident = serialized.get("id")
+        if isinstance(ident, (list, tuple)) and ident:
+            return str(ident[-1])
+        return ""
+
+    def on_tool_start(self, serialized, input_str, **kwargs) -> None:
+        try:
+            if self._tool_name(serialized) != self._QUERY_TOOL:
+                return
+            sql = ""
+            inputs = kwargs.get("inputs")
+            if isinstance(inputs, dict) and inputs.get("query"):
+                sql = str(inputs["query"]).strip()
+            if not sql:
+                raw = (input_str or "").strip()
+                # input_str may be the raw SQL, or a dict-repr like {'query': 'SELECT ...'}
+                if raw.startswith("{") and "query" in raw:
+                    m = re.search(r"""['"]query['"]\s*:\s*['"](.*)['"]\s*\}?\s*$""", raw, re.DOTALL)
+                    sql = (m.group(1) if m else raw).strip()
+                else:
+                    sql = raw
+            self._pending[str(kwargs.get("run_id") or "")] = sql
+        except Exception:  # noqa: BLE001 — a callback must never break the agent run
+            pass
+
+    def on_tool_end(self, output, **kwargs) -> None:
+        try:
+            rid = str(kwargs.get("run_id") or "")
+            sql = self._pending.pop(rid, None)
+            if sql:
+                self.calls.append((sql, str(output)))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class TransactionalDataAgent:
@@ -39,6 +97,22 @@ class TransactionalDataAgent:
         )
 
     @staticmethod
+    def _scope_period_clause(settings: Settings) -> str:
+        """Instruction bounding every query to the audit scope period. The date COLUMN differs per
+        dashboard, so this is a directive the agent applies on each table's own date column — not a
+        single fixed predicate. Returns a 'no period' note when neither bound is set (no date filter)."""
+        start = (getattr(settings, "scope_period_start", "") or "").strip()
+        end = (getattr(settings, "scope_period_end", "") or "").strip()
+        if start and end:
+            return (f"Include ONLY rows whose transaction/posting/billing/event date is BETWEEN {start} "
+                    f"AND {end} (inclusive).")
+        if start:
+            return f"Include ONLY rows whose transaction/posting/billing/event date is ON OR AFTER {start}."
+        if end:
+            return f"Include ONLY rows whose transaction/posting/billing/event date is ON OR BEFORE {end}."
+        return "(no scope period configured — apply no date bound)"
+
+    @staticmethod
     def _build_tables_block(settings: Settings) -> str:
         return "\n".join(
             f"  - {name}    ({DASHBOARD_TABLE_DESCRIPTIONS.get(key, 'transactional data')})"
@@ -49,10 +123,16 @@ class TransactionalDataAgent:
         db = self._build_databricks_db(settings)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
+        if not settings.engagement_filter_clause:
+            logger.warning(
+                "[TransactionalDataAgent] No engagement filter configured — NL->SQL queries will run "
+                "UNSCOPED across all audits. Set AUDIT_ENGAGEMENT_NUMBERS so results are audit-scoped."
+            )
         prefix = SQL_PREFIX_TEMPLATE.format(
             scope_id=settings.current_scope_id,
             tables_block=self._build_tables_block(settings),
             engagement_filter=settings.engagement_filter_clause,
+            scope_period_filter=self._scope_period_clause(settings),
         ) + "\n\n" + TRANSACTIONAL_DATA_DICTIONARY
         return create_sql_agent(
             llm=llm,
@@ -115,6 +195,20 @@ class TransactionalDataAgent:
             return ""
         lines = ["Tables & queries executed (exact, from the SQL actually run):"]
         for i, (sql, _res) in enumerate(pairs, 1):
+            tbls = ", ".join(cls._tables_in_sql(sql)) or "(none parsed)"
+            lines.append(f"[{i}] Tables: {tbls}")
+            lines.append(f"    SQL: {' '.join(sql.split())}")
+        return "\n".join(lines)
+
+    @classmethod
+    def build_tables_block_from_calls(cls, calls: list[tuple[str, str]]) -> str:
+        """Same 'Tables & queries executed' block, but built from a SqlQueryCaptureHandler's
+        captured (sql, result) calls — the version-robust path that does not depend on
+        return_intermediate_steps being forwarded."""
+        if not calls:
+            return ""
+        lines = ["Tables & queries executed (exact, from the SQL actually run):"]
+        for i, (sql, _res) in enumerate(calls, 1):
             tbls = ", ".join(cls._tables_in_sql(sql)) or "(none parsed)"
             lines.append(f"[{i}] Tables: {tbls}")
             lines.append(f"    SQL: {' '.join(sql.split())}")

@@ -145,12 +145,23 @@ def _additional_inputs_story(llm: BaseChatModel | None, scope_area: str,
     return _additional_inputs_story_fallback(by_source)
 
 
-def build_summary_cell(llm: BaseChatModel | None, scope_area: str, parts: ScopeSummaryParts) -> str:
+def build_summary_cell(
+    llm: BaseChatModel | None, scope_area: str, parts: ScopeSummaryParts, totals_line: str = "",
+) -> str:
     """Build the full Sheet B 'Summary of Risks' cell: the system STORY (already generated as a
     narrative by the summary generator — used as-is, never re-structured) plus a short story of what
-    the other sources raised."""
+    the other sources raised.
+
+    `totals_line` is the exact Output F transaction line for this scope. It is prepended so EVERY scope
+    shows its transactions — including scopes surfaced only by a Direction-2/KB source, whose rows never
+    went through the system Output F path. It is NOT re-added when the system story already leads with it
+    (System scopes carry an identical line), so it is never duplicated."""
     system_story = "\n".join(t.strip() for t in parts.system if t.strip())
     additional = _additional_inputs_story(llm, scope_area, parts)
     if system_story and additional:
-        return f"{system_story}\n\n{additional}"
-    return system_story or additional
+        body = f"{system_story}\n\n{additional}"
+    else:
+        body = system_story or additional
+    if totals_line and not body.lstrip().startswith("Total transactions:"):
+        body = f"{totals_line}\n{body}" if body else totals_line
+    return body

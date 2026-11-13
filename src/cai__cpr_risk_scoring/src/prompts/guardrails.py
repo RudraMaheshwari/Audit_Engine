@@ -77,6 +77,43 @@ G6  UNCERTAINTY HANDLING
     conclusion not supported by the available evidence.
 """ + US_ENGLISH + DATE_FORMAT + TEXT_HYGIENE
 
+FACT_CONSISTENCY = """\
+====================================================
+FACTUAL CONSISTENCY — REQUIRED vs ACTUAL (applies to every field you write)
+====================================================
+
+When a finding turns on the VALUE of an attribute — a decision authority / approver, a status, an
+amount, a rate, a date, a party, or a classification — keep two things distinct and never conflate them:
+  • the value the policy REQUIRES or expects, and
+  • the value the EVIDENCE ACTUALLY records.
+State each explicitly and make clear which is which. Use the SAME actual value, and the SAME required
+value, consistently across EVERY field of this output. Do NOT present a value as the requirement in one
+field and as the actual record in another, and do NOT let the actual value differ between fields (e.g.
+naming one authority / approver / amount / status for an item in one field and a different one for the
+same item elsewhere). Read a value only from the field that actually holds it; never substitute a value
+taken from a different attribute. If the evidence does not clearly establish the actual value, say it is
+"not evidenced" / "could not be determined from the record" rather than asserting a specific value or
+inferring it from a differently labelled field.
+When MULTIPLE records or items are in play (several IDs, parties, invoices, dates, or line items),
+attribute each value to ITS OWN identifier — state the value beside the record it belongs to, and never
+carry a value from one record onto a different one. If you cannot tell which record a value belongs to,
+say so rather than attaching it to an arbitrary record.
+
+READ FROM THE RIGHT COLUMN — DO NOT CONFUSE A TYPE/CATEGORY WITH AN AUTHORITY/STATUS: a value must be
+read from the column whose HEADER names that attribute, never from a different, adjacent, or similar-
+looking column. Spreadsheet extracts can have DRIFTING / MISALIGNED columns where the same token appears
+under different headers in different exports — when the alignment is ambiguous, state the value is "could
+not be determined from the record" and do NOT assert a confirmed gap (treat as Further Review), rather
+than reading a value out of the wrong column.
+  • Example — Red Flag / TPI records: the red-flag "Type" (e.g. "HCC") is the RISK TYPE, NOT the Decision
+    Authority. Decision/approval authorities are governance bodies — RWG, TPEC, HCC Committee, LWG. Read
+    the authority ONLY from the "Decision Authority"/approver column. If that column records RWG as the
+    deciding/approving authority, then RWG escalation/decision IS evidenced — NEVER report "RWG escalation
+    not evidenced" or treat "HCC" (the type) as the authority. When a conditionally-approved red flag has
+    a mitigation plan that is Not Started/incomplete, THAT (the open mitigation) is the control point —
+    not a missing RWG decision.
+"""
+
 RETRIEVAL_GUARDRAILS = """\
 G7  RETRIEVAL ONLY — NO RISK ASSESSMENT
     Do not assess risk, assign risk levels, classify compliance, or draw conclusions about
@@ -100,10 +137,13 @@ G7  READ-ONLY SQL — STRICTLY ENFORCED
     question seems to require data modification, refuse and state that write operations
     are not permitted.
 
-G8  SCHEMA FIRST — NO ASSUMED COLUMNS
-    Call sql_db_schema before writing any SQL query. Do not assume a column name exists.
-    Use only the columns confirmed by the schema tool response. If a needed column is absent
-    from the schema, state that the query cannot be executed and explain why.
+G8  NO ASSUMED COLUMNS — DICTIONARY IS AUTHORITATIVE
+    The DATA DICTIONARY provided in this prompt is the authoritative source for the documented
+    columns of each table — write SQL directly from it. Call sql_db_schema ONLY for a column the
+    dictionary does not cover (schema calls are large and spend your step budget — keep them
+    minimal). Never assume or invent a column name: use a column confirmed either by the dictionary
+    or by a schema-tool response. If a needed column is in neither, state that the query cannot be
+    executed and explain why.
 
 G9  NO FABRICATED RESULTS
     If a query returns zero rows, state that explicitly — do not invent numeric results,

@@ -195,10 +195,12 @@ QUESTION_CONCURRENCY             = 8
 MAX_TRANS_RETRIES                = 3
 # Hard cap on the per-question NL2SQL agent's reasoning/tool steps, so a single question can't run
 # away on the SQL warehouse. Counts ALL agent steps (list-tables + schema + queries + final answer),
-# so ~2-3 are fixed overhead (list-tables + schema) before actual queries. 4 was too low: the agent
-# ran out of steps after a single query and returned "no data" for rows whose data actually exists
-# (named-invoice / supplier / GL lookups need to try a LIKE match across BOTH payment + disbursement).
-TRANSACTIONAL_SQL_MAX_ITERATIONS = 12
+# so ~3-4 are fixed overhead (list-tables + schema) before actual queries. 12 was often exhausted when
+# the agent retried zero-row queries (e.g. English keyword LIKEs that can't match non-English payee
+# names across BOTH payment + disbursement), leaving no budget to finish and returning the "stopped due
+# to max iterations" sentinel. 18 gives enough room for list-tables + a couple of schema peeks + a few
+# query attempts + the final answer; the prompt's STEP-BUDGET rule stops it from looping past that.
+TRANSACTIONAL_SQL_MAX_ITERATIONS = 18
 
 # ── Canonical scope-area display names ───────────────────────────────────────
 # Internal scope_id → the agreed 48-item canonical display name. Applied everywhere a scope
@@ -261,6 +263,7 @@ SHEET_C_NAME                     = "Output C - AI Risk Analysis"
 SHEET_D_NAME                     = "Output D - Risk Summary"
 SHEET_E_NAME                     = "Output E - Past Audit Report"
 SHEET_F_NAME                     = "Output F - Scope Txn Summary"
+SHEET_G_NAME                     = "Output G - Other HCC Types"
 EXCEL_MAX_ROW_HEIGHT             = 150
 
 # ── Ingestion: supported file extensions ──────────────────────────────────────
@@ -300,7 +303,21 @@ IDR_COL_FOLLOWUP_RESPONSE        = "followup_response"
 # ── Questionnaire types ────────────────────────────────────────────────────────
 
 # ── Transactional analysis: TPI inventory ─────────────────────────────────────
+# Exact header of the English entity-name column (used for an exact-match first pass).
 TPI_INVENTORY_COL_ENTITY_NAME = "Third Party: Legal Entity Name (English)"
+# Exact header of the local-language (e.g. Korean) entity-name column.
+TPI_INVENTORY_COL_ENTITY_NAME_LOCAL = "Third Party: Legal Entity Name (Local Language)"
+# Header fragments (lowercase) that STRONGLY denote an entity-name column — every column matching one
+# is loaded, so BOTH the English and the Local-Language name columns are captured (the ledger may carry
+# either form). Kept SPECIFIC ("legal entity name"/"entity name") so a metadata/preamble sentence that
+# merely mentions "Third Party" (e.g. "Sorted by Third Party: Legacy Id") is NOT mistaken for the header
+# row. Edit here to match a differently-labelled inventory; the loader reads from this list.
+TPI_INVENTORY_ENTITY_HEADER_STRONG = ("legal entity name", "entity name")
+# Weaker fallback fragments (lowercase), tried only when no strong column is found — the single best
+# match wins. Order matters (earliest fragment preferred).
+TPI_INVENTORY_ENTITY_HEADER_FALLBACKS = (
+    "legal entity name", "entity name", "third party", "vendor", "supplier", "name",
+)
 
 # ── Transactional analysis: payments table column names ───────────────────────
 

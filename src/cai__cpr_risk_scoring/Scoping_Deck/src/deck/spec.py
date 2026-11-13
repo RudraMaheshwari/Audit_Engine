@@ -50,6 +50,9 @@ class FieldSpec:
     # When True, the whole slide is skipped if this field's content_key resolves to empty content
     # (e.g. the 'Risks noted by Management' slide only appears when management actually noted risks).
     skip_if_empty: bool = False
+    # TITLE only: allow the heading to wrap onto a second line instead of running off the slide edge
+    # (used for the long Prior CPR / GACS headings whose " (cont.)" suffix overflowed).
+    wrap_title: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,8 @@ class DynamicTableField:
     content_font: str
     content_size: int
     content_color_hex: str
+    # Max rows per slide before overflowing onto a continuation slide (content-aware). 0 = unlimited.
+    max_rows_per_slide: int = 0
 
 
 @dataclass(frozen=True)
@@ -456,6 +461,7 @@ def _prior_review_table(header_template: str, content_key: str) -> DynamicTableF
         header_font=_BODY_FONT, header_size=18, header_color_hex="FFFFFF", header_fill_hex="EB1700",
         topic_font=_BODY_FONT, topic_size=12, topic_color_hex="000000",
         content_font="Johnson Text", content_size=11, content_color_hex="000000",
+        max_rows_per_slide=8,   # overflow onto continuation slides when findings exceed the slide
     )
 
 
@@ -510,7 +516,7 @@ AREAS_IN_SCOPE_SLIDE = SlideSpec(
         _areas_table(
             headers=(
                 "Compliance Process Review Area", "Full / Limited Scope", "Sample Size",
-                "Total no. of transactions", "Total amount of transactions (Local / USD)", "Comments",
+                "Total no. of transactions", "Total amount of transactions (USD)", "Comments",
             ),
             content_key="scope_in_rows",
             col_widths=(2.6, 1.4, 1.1, 1.7, 1.9, 3.63),
@@ -530,7 +536,7 @@ AREAS_NOT_IN_SCOPE_SLIDE = SlideSpec(
         _areas_table(
             headers=(
                 "Compliance Process Review Area", "Total no. of transactions",
-                "Total amount of transactions (Local / USD)", "Comments",
+                "Total amount of transactions (USD)", "Comments",
             ),
             content_key="scope_out_rows",
             col_widths=(3.2, 2.4, 2.8, 3.93),

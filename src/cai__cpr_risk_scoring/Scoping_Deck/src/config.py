@@ -91,7 +91,10 @@ class ScopingDeckConfig:
 
     def _qualify(self, index_name: str) -> str:
         s = self.settings
-        return f"{s.databricks_catalog}.{s.databricks_schema_name}.{index_name}"
+        # Same optional per-run suffix as VectorIndexManager, so the deck's questionnaire/past-review
+        # indexes land under the SAME names on an isolated-run endpoint. Empty by default.
+        sfx = getattr(s, "index_name_suffix", "") or ""
+        return f"{s.databricks_catalog}.{s.databricks_schema_name}.{index_name}{sfx}"
 
 
 class ConfigLoader:

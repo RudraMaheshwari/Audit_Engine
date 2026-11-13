@@ -5,6 +5,8 @@ aggregation agent, sets Past Occurrence per risk via the (per-auditor) knowledge
 computes the scope-level Overall Risk Category (average) for the Risk Summary.
 """
 
+import re
+
 from src.config.constants import (
     MANUAL_REVIEW_LABEL,
     MATRIX_BAND_HIGH_MIN,
@@ -160,6 +162,20 @@ def _record_findings(recorder, run_id, risks: list[AggregatedRisk]) -> None:
         })
 
 
+def _split_scopes(scope_area: str) -> list[str]:
+    """Split a (possibly compound) scope_area into individual scope areas, order-preserving.
+    A per-question finding may be tagged with several scopes joined by ';' (or '|') — each becomes its
+    own aggregation bucket. Empty → one '(unscoped)' bucket so nothing is dropped."""
+    if not scope_area or not scope_area.strip():
+        return ["(unscoped)"]
+    seen: list[str] = []
+    for part in re.split(r"[;|]", scope_area):
+        s = part.strip()
+        if s and s not in seen:
+            seen.append(s)
+    return seen or ["(unscoped)"]
+
+
 def run_aggregation(
     aggregation_agent,
     retriever: KnowledgeRetriever | None,
@@ -178,11 +194,41 @@ def run_aggregation(
         logger.info("[Aggregation] No reportable findings to cluster — skipping aggregation")
         return [], {}
 
+    # Scope-bucketed clustering: partition findings by scope area and cluster ONE scope at a time, so
+    # DISTINCT scope areas can NEVER be merged (the LLM never sees two scopes together). A multi-scope
+    # finding (scope_area like "Due Diligence; FCPA Training; …") is placed into EACH of its scope
+    # buckets (with scope_area narrowed to that bucket), so each scope's concern is clustered on its own.
+    # Within a bucket the agent still emits one risk per DISTINCT risk type (a scope can hold several).
+    buckets: dict[str, list] = {}
+    for rf in raws:
+        for scope in _split_scopes(rf.scope_area):
+            buckets.setdefault(scope, []).append(rf.model_copy(update={"scope_area": scope}))
+
     logger.info(
-        "[Aggregation] Clustering %d reportable findings into unique risks "
-        "(single LLM call — may take a few minutes)…", len(raws),
+        "[Aggregation] %d reportable finding(s) → %d scope bucket(s) | findings per scope: %s",
+        len(raws), len(buckets), {s: len(v) for s, v in buckets.items()},
     )
-    risks = aggregation_agent.aggregate(raws)
+
+    risks: list[AggregatedRisk] = []
+    for bno, (scope, bucket_raws) in enumerate(buckets.items(), start=1):
+        logger.info(
+            "[Aggregation] Bucket %d/%d | scope='%s' | findings=%d | clustering (LLM call)…",
+            bno, len(buckets), scope, len(bucket_raws),
+        )
+        try:
+            bucket_risks = aggregation_agent.aggregate(bucket_raws)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[Aggregation] Bucket clustering FAILED | scope='%s' | findings=%d | error=%s",
+                         scope, len(bucket_raws), exc, exc_info=True)
+            bucket_risks = []
+        logger.info(
+            "[Aggregation] Bucket %d/%d | scope='%s' | %d finding(s) → %d risk(s) | risk_types=%s",
+            bno, len(buckets), scope, len(bucket_raws), len(bucket_risks),
+            [getattr(r, "risk_type", "?") for r in bucket_risks],
+        )
+        risks.extend(bucket_risks)
+
+    logger.info("[Aggregation] All %d bucket(s) clustered → %d total risk(s)", len(buckets), len(risks))
     if retriever is not None:
         logger.info("[Aggregation] Applying recurrence lookups | risks=%d", len(risks))
         # Whether ANY historical KB exists for this auditor — distinguishes a searched "No" from

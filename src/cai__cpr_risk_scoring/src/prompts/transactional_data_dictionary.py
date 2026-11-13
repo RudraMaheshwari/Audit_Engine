@@ -109,6 +109,12 @@ AP PAYMENTS dashboards (disbursement_dashboard, payment_dashboard):
 - Vendor: SUPPLIER_NAME / VENDOR_NAME. Anomaly flags precomputed (DUP_PAYMENT_FLAG, ROUND_DOLLAR_FLAG,
   HIGH_DOLLARS_PAYMENTS_FLAG, HIGH_RISK_VENDORS_FLAG) — use them.
 - GOVERNMENT-OWNED ENTITY (GOE) IDENTIFICATION — use GOVT_FLAG as the AUTHORITATIVE government flag:
+  COLUMN AVAILABILITY (MANDATORY): GOVT_FLAG and GOVERNMENT_VENDORS are present only in some AP extracts
+  — they are NOT in every engagement. Use either column ONLY if it appears in the AVAILABLE TABLES AND
+  COLUMNS for the table you query. If NEITHER is listed there, do NOT select, filter, or reference them
+  at all (referencing an absent column fails the whole query); instead identify government payees from
+  the payee NAME (hospital, university, clinic, medical center, ministry, institute — in English or the
+  local language/script) via SUPPLIER_NAME / VENDOR_NAME / INVOICE_DESCRIPTION / PO_DESCRIPTION.
   GOVT_FLAG = 'Government Vendors' means a government-owned/controlled payee; GOVT_FLAG =
   'Non Government Vendors' means NON-government. It derives from GOVERNMENT_VENDORS:
   GOVERNMENT_VENDORS = 'Other' → NON-government (GOVT_FLAG = 'Non Government Vendors'); every OTHER
@@ -157,7 +163,8 @@ AP PAYMENTS dashboards (disbursement_dashboard, payment_dashboard):
       onboarding / approval, and describe any onboarding- or approval-bypass as a risk for auditors to
       investigate — NOT as a confirmed violation of every payment.
 
-HCC dashboard (hcc_dashboard — FFS / HCC events):
+HCC dashboard (hcc_dashboard — USER-INPUT table; typically EMPTY — do NOT use as the HCC source and do
+NOT read "no data" from it. For HCC activity analysis use hcc_full + hcc_attendee below):
 - Event/FFS data: HCP_NAME, EVENT_NAME, TOTAL_ACTIVITY_APPROVED_AMOUNT, FAIR_MARKET_VALUE, FMV_FLAG,
   APPROVED_AMOUNT_SAME_AS_PAID_AMOUNT_FLAG, GOA_FLAG, HCC_ACCOUNTS. Judge FFS/FMV/approval risk here —
   NOT pricing/override/discount.
@@ -165,10 +172,23 @@ HCC dashboard (hcc_dashboard — FFS / HCC events):
   'Event Invitee', 'Advisory Board', 'Speaker'). To scope a query to an activity, match CATEGORY
   against the REAL distinct values provided in the data summary — never a guessed term. A congress /
   organized-event filter must include the 'Event Invitee' / 'Organized' style values, not just the
-  literal word 'Congress'.
+  literal word 'Congress'. When CATEGORY is NULL, OR holds a GENERIC PLACEHOLDER value that does not
+  name a real activity (e.g. 'Category 1', 'Category 2', 'Category-1', 'Cat 1' — a bare 'Category'
+  followed by a number), it is not meaningful: fall back to REQUEST_TYPE (the event sub-type) for the
+  activity type. Compute the effective activity type as
+  CASE WHEN CATEGORY IS NULL OR trim(CATEGORY) = '' THEN REQUEST_TYPE
+       WHEN lower(trim(CATEGORY)) RLIKE '^(category|cat)[ -]*[0-9]+$' THEN REQUEST_TYPE
+       ELSE CATEGORY END
+  — i.e. prefer a real CATEGORY value, but when CATEGORY is NULL/empty or a 'Category N' placeholder use REQUEST_TYPE.
+- EVENT CONTEXT (use to segment / enrich findings, match against REAL distinct values, never guessed):
+  BUSINESS_UNIT (business unit organizing the event), STAGE_STATUS (event status — 'Pre Event' /
+  'Post Event'), LOCATION_VENUE (event location/venue), NO_OF_ATTENDEES (attendee count for the event;
+  numeric — wrap in try_cast(... AS DOUBLE) and treat as a size/scale signal, not a spend amount).
 - EVENT-SPEND AMOUNT: use DOCUMENT_CURRENCY_INVOICE_AMT_USD; when it is NULL or 0, fall back to
-  ACTIVITY_APPROVED_AMT_USD. Compute spend as
-  COALESCE(NULLIF(try_cast(DOCUMENT_CURRENCY_INVOICE_AMT_USD AS DOUBLE), 0), try_cast(ACTIVITY_APPROVED_AMT_USD AS DOUBLE)).
+  ACTIVITY_APPROVED_AMT_USD; when that too is NULL or 0, fall back to TOTAL_ACTIVITY_APPROVED_AMOUNT
+  (document/local currency — not USD-converted, but it is the only populated amount in some
+  engagements, so use it rather than return nothing). Compute spend as
+  COALESCE(NULLIF(try_cast(DOCUMENT_CURRENCY_INVOICE_AMT_USD AS DOUBLE), 0), NULLIF(try_cast(ACTIVITY_APPROVED_AMT_USD AS DOUBLE), 0), try_cast(TOTAL_ACTIVITY_APPROVED_AMOUNT AS DOUBLE)).
 - DORMANT / UNFED COLUMNS — DO NOT infer "no HCC monitoring / no reviews / no validations" from these:
   VALIDATION_RESULT and VALIDATION_DATE are 100% NULL across the ENTIRE dataset (all tables), and
   HCCO_REVIEW_DATE / EVENT_REVIEWER_WWID are populated on well under 1% of rows. These columns are
@@ -180,9 +200,12 @@ HCC dashboard (hcc_dashboard — FFS / HCC events):
   "zero reviews/validations / no monitoring performed" finding from them.
 
 TRAVEL & EXPENSE dashboard (travel_and_expense_dashboard):
-- Employee T&E: EXPENSE_NAME, RPT_ENT_EXP_TYPE_NM, LC_INVC_LINE_AMT, MERCH_CAT_CD, plus precomputed
-  anomaly flags (DUP_PAYMENT_FLAG, ROUND_DOLLAR_FLAG, SUSPICIOUS_MCC_FLAG). This is expense data —
-  NOT pricing/override/discount.
+- Employee T&E: EXPENSE_NAME, RPT_ENT_EXP_TYPE_NM, MERCH_CAT_CD, plus precomputed anomaly flags
+  (DUP_PAYMENT_FLAG, ROUND_DOLLAR_FLAG, SUSPICIOUS_MCC_FLAG). This is expense data — NOT
+  pricing/override/discount.
+- AMOUNT (MANDATORY): the reportable USD amount is GC_INVC_LINE_AMT (Group/global currency = USD) —
+  ALWAYS use this for totals and thresholds. LC_INVC_LINE_AMT is the LOCAL currency amount; do NOT use
+  it for USD figures or cross-scope comparison.
 
 EQUIPMENT PLACEMENT:
 - There is NO equipment-placement dataset in these tables (the EQUIPMENTS / EQUIPMENT_SCORE columns

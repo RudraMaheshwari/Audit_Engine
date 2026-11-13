@@ -73,7 +73,8 @@ class PastReviewTableBuilder:
         for scope, items in groups.items():
             entry = condensed.get(scope) or {}
             # Display label = full form inferred from the findings by the LLM; raw scope if none.
-            label = entry.get("label") or scope
+            # Kept short deterministically so the scope-area column doesn't overrun the slide cell.
+            label = self._concise_label(entry.get("label") or scope)
             bullets = entry.get("bullets") or self._fallback(items, max_bullets)
             rows_list.append((label, "\n".join(f"- {b}" for b in bullets)))
         return PastReviewTable(rows=tuple(rows_list), year=year)
@@ -86,6 +87,20 @@ class PastReviewTableBuilder:
         for obs in observations:
             groups.setdefault(PastReviewTableBuilder._top_level_scope(obs.scope_area), []).append(obs)
         return groups
+
+    @staticmethod
+    def _concise_label(label: str) -> str:
+        """Keep a scope-area display label short so it fits the slide cell. Collapses a long enumerated
+        parenthetical ('Multiple areas (A; B; C; …)' -> 'Multiple areas') and hard-caps at a word
+        boundary."""
+        s = (label or "").strip()
+        if "(" in s and len(s) > 45:
+            head = s.split("(")[0].strip(" -–—")
+            if head:
+                s = head
+        if len(s) > 60:
+            s = s[:60].rsplit(" ", 1)[0].rstrip(" ,;-") + "…"
+        return s
 
     @staticmethod
     def _top_level_scope(scope_area: str) -> str:

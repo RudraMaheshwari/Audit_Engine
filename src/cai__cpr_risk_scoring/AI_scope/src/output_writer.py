@@ -20,7 +20,9 @@ from src.utils.dateformat import normalize_dates
 from src.utils.logger import get_logger
 from src.utils.xml_clean import sanitize_xlsx, xml_safe
 
+from .scope_key import normalize
 from .sheet_b_formatter import ScopeSummaryParts, build_summary_cell
+from .summary_generator import _totals_line
 
 try:
     from openpyxl.cell.rich_text import CellRichText, TextBlock
@@ -174,12 +176,18 @@ def _merge_evidence(items: list) -> str:
     return ("\n" + "─" * 40 + "\n").join(blocks)
 
 
-def _aggregate_by_scope(rows: list, llm=None) -> list[tuple]:
+def _aggregate_by_scope(rows: list, llm=None, txn_totals: dict | None = None) -> list[tuple]:
     """Collapse Sheet-A rows into one per scope area for Sheet B (merge rules in module docstring).
 
     The Summary of Risks cell is built by the Sheet B formatter: AI-structured system risk points
     followed by an 'Additional Inputs' section listing what each Direction-2 source raised.
+
+    `txn_totals` (Output F, keyed by normalize(scope)) lets Sheet B prepend the exact transaction
+    totals line for EVERY scope — including scopes surfaced only by a KB/Direction-2 source, which the
+    system-row path never ran Output F for. The formatter avoids duplicating it for System scopes whose
+    story already carries it.
     """
+    txn_totals = txn_totals or {}
     groups: dict[str, dict] = {}
     order: list[str] = []
     for row in rows:
@@ -207,18 +215,19 @@ def _aggregate_by_scope(rows: list, llm=None) -> list[tuple]:
     out: list[tuple] = []
     for scope in order:
         g = groups[scope]
+        totals_line = _totals_line(txn_totals.get(normalize(scope)))
         out.append((
             scope,
             g["scope_decision"],
             g["category"] or "-",
             "" if g["sample"] is None else g["sample"],
-            build_summary_cell(llm, scope, g["parts"]),
+            build_summary_cell(llm, scope, g["parts"], totals_line=totals_line),
             _merge_evidence(g["evidence"]),
         ))
     return out
 
 
-def write_ai_scope(rows, output_path: str | Path, llm=None) -> tuple[Path, list[tuple]]:
+def write_ai_scope(rows, output_path: str | Path, llm=None, txn_totals: dict | None = None) -> tuple[Path, list[tuple]]:
     """Write Sheet A (detail) and Sheet B (aggregated); return (path, sheet_b_rows).
 
     `llm` (optional) is used to AI-structure the Sheet B 'Summary of Risks' points; when omitted the
@@ -241,7 +250,7 @@ def write_ai_scope(rows, output_path: str | Path, llm=None) -> tuple[Path, list[
     for row_idx, row in enumerate(rows, start=2):
         _write_values(ws_a, row_idx, _detail_values(row), category_col=4, category=row.overall_risk_category)
 
-    summary_rows = _aggregate_by_scope(rows, llm)
+    summary_rows = _aggregate_by_scope(rows, llm, txn_totals=txn_totals)
     ws_b = wb.create_sheet(_SHEET_B_NAME)
     _write_header(ws_b, _SUMMARY_COLUMNS)
     for row_idx, values in enumerate(summary_rows, start=2):

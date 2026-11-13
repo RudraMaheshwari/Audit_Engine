@@ -35,8 +35,11 @@ def build_evidence_assessment_agent(
     @tool
     def retrieve_evidence_targeted(query: str, scope_id: str, document_name: str) -> str:
         """
-        Targeted retrieval filtered to a specific document the auditor cited by name.
-        Use when the auditor response explicitly mentions a document file (e.g. 'TPI_Report.pdf').
+        Targeted retrieval filtered to ONE document — pulls the COMPLETE set of relevant rows/chunks
+        from it. Use whenever the response references a document / attachment / record / log / register /
+        list, whether it names the file OR refers to it only generically (without a filename): pass the
+        cited filename when given, else the most relevant document_name surfaced by the semantic pass.
+        The absence of a filename is NOT a reason to skip this call.
         """
         logger.info(
             "[EvidenceAssessment] Targeted retrieval | scope=%s | document=%s",

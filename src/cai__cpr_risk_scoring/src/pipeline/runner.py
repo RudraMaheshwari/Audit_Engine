@@ -99,6 +99,7 @@ from src.agents.risk_aggregation_agent import RiskAggregationAgent
 from src.knowledge_base import KnowledgeRetriever, build_raw_table_chunks, build_transactional_chunks
 from src.pipeline.aggregation_stage import run_aggregation
 from src.pipeline.continuity import compute_continuity, write_continuity_report
+from src.pipeline.output_f_stage import build_and_write_output_f, build_and_write_output_g
 from src.pipeline.past_audit_stage import summarize_past_audits
 from src.pipeline.graph import build_audit_graph
 from src.pipeline.prior_context import format_prior_context
@@ -231,28 +232,34 @@ def _process_and_upsert_file(
     #   unchanged  → skip (no extract/embed/upsert),
     #   changed    → delete this file's stale chunks, then re-ingest below,
     #   new / "" → ingest below. The hash is stamped onto every chunk so the next run can compare.
+    # Always fingerprint the downloaded bytes so the NEXT run can compare — even on the first
+    # (full) ingest. Stamping the hash unconditionally is what makes change detection converge:
+    # if the first population carries no hash, every later run reads "" and re-ingests forever.
+    # We only ACT on the comparison (skip unchanged / clear-then-reingest) when the index already
+    # holds this auditor's data.
     content_hash = ""
-    if change_detect:
+    try:
+        content_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Ingest] Could not hash file — ingesting unconditionally | file=%s | %s",
+                       file_name, exc)
+    if change_detect and content_hash:
+        stored = index_manager.fetch_document_hash(index_key, auditor_folder or "", file_name)
+        if stored == content_hash:
+            logger.info("[Ingest] ⏭ Unchanged — skipping | folder=%s | file=%s", folder_label, file_name)
+            local_path.unlink(missing_ok=True)
+            return 0
+        # Changed, new-to-this-index, or legacy chunks with no stored hash (incl. old uuid4 rows):
+        # clear this file's existing chunks first so the re-ingest below can't leave duplicates.
+        # (For a genuinely new file the scan finds nothing and returns immediately — harmless.)
+        logger.info("[Ingest] ✎ Changed/new — re-ingesting | folder=%s | file=%s", folder_label, file_name)
         try:
-            content_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
+            index_manager.delete_by_document_name(
+                index_key, file_name, auditor_folder=auditor_folder or None,
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[Ingest] Could not hash file — ingesting unconditionally | file=%s | %s",
+            logger.warning("[Ingest] Stale-chunk delete failed (continuing) | file=%s | %s",
                            file_name, exc)
-        if content_hash:
-            stored = index_manager.fetch_document_hash(index_key, auditor_folder or "", file_name)
-            if stored == content_hash:
-                logger.info("[Ingest] ⏭ Unchanged — skipping | folder=%s | file=%s", folder_label, file_name)
-                local_path.unlink(missing_ok=True)
-                return 0
-            if stored:
-                logger.info("[Ingest] ✎ Changed — re-ingesting | folder=%s | file=%s", folder_label, file_name)
-                try:
-                    index_manager.delete_by_document_name(
-                        index_key, file_name, auditor_folder=auditor_folder or None,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[Ingest] Stale-chunk delete failed (continuing) | file=%s | %s",
-                                   file_name, exc)
 
     logger.info("[Ingest] ⚙ Extracting  | folder=%s | file=%s", folder_label, file_name)
     try:
@@ -277,13 +284,21 @@ def _process_and_upsert_file(
     # later run can detect an in-place edit to this same file.
     if auditor_folder or content_hash:
         tagged = []
-        for c in chunks:
+        for i, c in enumerate(chunks):
             upd: dict = {}
             if auditor_folder:
                 upd["auditor_folder"] = auditor_folder
             if content_hash:
                 upd["metadata"] = {**(c.metadata or {}), "content_hash": content_hash}
-            tagged.append(c.model_copy(update=upd) if upd else c)
+            # Deterministic primary key: re-ingesting the SAME file overwrites its own chunks
+            # (idempotent upsert) instead of adding fresh uuid4 rows every run — the duplication
+            # that made content-hash change detection never converge. Scoped by auditor so the
+            # shared KB / supporting indexes never collide across auditors, and stable because the
+            # chunker emits chunks in a fixed order for a given file.
+            upd["chunk_id"] = hashlib.sha256(
+                f"{auditor_folder or ''}|{file_name}|{i}".encode("utf-8")
+            ).hexdigest()
+            tagged.append(c.model_copy(update=upd))
         chunks = tagged
 
     total_tokens = sum(int(getattr(c, "token_count", 0) or 0) for c in chunks)
@@ -379,17 +394,19 @@ def _ensure_supporting_docs_index(index_manager, settings, auditor_id: str) -> N
     auditor's documents are already embedded, ingestion is skipped so nothing is re-embedded. Only
     the current auditor's subfolder is ingested.
     """
-    # Re-ingest on change (same as the KB indexes): when the auditor already has data, each file's
-    # content hash is compared and only NEW or EDITED files are re-embedded (unchanged files skipped).
-    # A fresh/empty index is a full ingest. This replaces the old all-or-nothing skip, which missed
-    # files added or changed after the first ingest.
-    change_detect = index_manager.is_populated_for_auditor("supporting", auditor_id)
-    index_manager.ensure_index("supporting")
-    if change_detect:
+    # Supporting docs use an ALL-OR-NOTHING skip, NOT per-file content-hash change detection: if this
+    # auditor already has data, skip ingestion entirely so nothing is re-embedded. The content-hash path
+    # is intentionally disabled here — chunk ids are random UUIDs, so it re-ingested every file on every
+    # run and accumulated duplicate chunks instead of converging. To pick up newly added or edited
+    # supporting files, delete this auditor's chunks (or the index) to force a fresh full ingest.
+    if index_manager.is_populated_for_auditor("supporting", auditor_id):
         logger.info(
-            "[Ingest] supporting_docs already populated — re-ingesting only changed/new files | auditor=%s",
+            "[Ingest] supporting_docs already populated for auditor — skipping (no re-ingest) | auditor=%s",
             auditor_id,
         )
+        return
+    index_manager.ensure_index("supporting")
+    change_detect = False  # fresh index → full ingest; no per-file content-hash comparison for supporting
 
     auditor_volume = settings.resolved_supporting_docs_folder
     logger.info("[Ingest] Listing auditor supporting docs | volume=%s", auditor_volume)
@@ -577,10 +594,14 @@ def _resolve_tpi_inventory_path(settings, auditor_id: str, cache_dir: Path) -> s
     return None
 
 
-def _prepare_reference_files(settings, auditor_id: str, llm=None) -> str:
+def _prepare_reference_files(settings, auditor_id: str, llm=None) -> tuple[str, list[str]]:
     """Download the GL map + resolve the TPI inventory from the Volume to local cache, repoint settings
     to the local copies (so Phase 3 and the classifier injection can read them), resolve the auditor's
-    inventory sheet, and return the formatted TPI inventory block (empty string if unavailable)."""
+    inventory sheet, and return (formatted TPI inventory block, loaded TPI names).
+
+    The raw names are returned so the caller can hand them to TransactionalDataAnalysisAgent and AVOID a
+    second, independent load — load_tpi_inventory_names uses non-deterministic LLM column detection, so
+    re-loading can yield 0 names on a run where this load got the full list."""
     cache_dir = _PROJECT_ROOT / ".cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -594,7 +615,7 @@ def _prepare_reference_files(settings, auditor_id: str, llm=None) -> str:
     tpi_path = _resolve_tpi_inventory_path(settings, auditor_id, cache_dir)
     if not tpi_path:
         settings.tpi_inventory_file_path = ""
-        return ""
+        return "", []
     settings.tpi_inventory_file_path = tpi_path
 
     # Auto-derive the auditor's sheet unless an explicit override is configured.
@@ -614,7 +635,7 @@ def _prepare_reference_files(settings, auditor_id: str, llm=None) -> str:
         "[Ref] TPI inventory loaded | names=%d | sheet=%s",
         len(names), settings.tpi_inventory_sheet or "(unresolved)",
     )
-    return format_tpi_inventory_block(names, settings.tpi_inventory_sheet)
+    return format_tpi_inventory_block(names, settings.tpi_inventory_sheet), names
 
 
 def _ensure_kb_volume_index(
@@ -738,109 +759,9 @@ def _ensure_kb_indexes(index_manager, settings, auditor_id: str, on_phase=None) 
             logger.error("[Ingest] KB ingest failed | index=%s | error=%s", index_key, exc, exc_info=True)
 
 
-def _write_scope_txn_summary(transactional_agent, output_writer, output_path) -> None:
-    """Build and write the per-scope transaction summary sheet.
-
-    Every canonical scope area appears; scopes with no transactions render '-'. USD is converted to the
-    audit's local currency (resolved at runtime from the data, not a fixed config) at each transaction
-    date's FX rate — no invented or fixed rates; local shown only when a real rate resolves.
-    """
-    import datetime as _dt
-
-    from src.config.constants import SCOPE_ID_TO_DISPLAY_NAME
-    from src.services.fx_rates import FxRateService
-
-    summaries = transactional_agent.build_scope_transaction_summary()
-    by_scope = {s.scope_id: s for s in summaries}
-
-    local_code = transactional_agent.resolve_local_currency()
-
-    all_days: list[_dt.date] = []
-    for s in summaries:
-        for day_str in list(s.usd_by_date) + list(s.doc_usd_by_date):
-            if day_str:
-                try:
-                    all_days.append(_dt.date.fromisoformat(day_str))
-                except ValueError:
-                    pass
-
-    fx = FxRateService(base="USD", local=local_code)
-    if all_days:
-        fx.load_period(min(all_days), max(all_days))
-    latest_day = max(all_days) if all_days else None
-
-    def _local_total(usd_by_date: dict) -> float | None:
-        """Sum USD→local at each date's FX rate; None if any date cannot be converted."""
-        total = 0.0
-        for day_str, usd in usd_by_date.items():
-            day = None
-            if day_str:
-                try:
-                    day = _dt.date.fromisoformat(day_str)
-                except ValueError:
-                    day = None
-            conv_day = day or latest_day
-            converted = fx.convert(usd, conv_day) if conv_day else None
-            if converted is None:
-                return None
-            total += converted
-        return total
-
-    def _amount_cell(usd_by_date: dict, usd_total: float, present: bool) -> str:
-        if not present:
-            return "-"
-        # A count with no monetary data (e.g. a name-list supporting doc that has entries but no money
-        # column) — show "-" for the amount rather than a misleading "USD 0.00".
-        if not usd_by_date and not usd_total:
-            return "-"
-        local = _local_total(usd_by_date)
-        if local is None:
-            return f"USD {usd_total:,.2f}"
-        return f"{local_code} {local:,.2f} / USD {usd_total:,.2f}"
-
-    rows: list[tuple] = []
-    for scope_id, display in SCOPE_ID_TO_DISPLAY_NAME.items():
-        summary = by_scope.get(scope_id)
-        if summary is None:
-            rows.append((display, "-", "-", "-", "-", "-", "-", "-", "-"))
-            continue
-
-        table_present = summary.txn_count > 0 or bool(summary.usd_by_date)
-        doc_present = summary.doc_txn_count > 0 or bool(summary.doc_usd_by_date)
-
-        # Transaction counts split by origin + combined total.
-        table_txns = summary.txn_count if table_present else "-"
-        doc_txns = summary.doc_txn_count if doc_present else "-"
-        total_txns = (summary.txn_count + summary.doc_txn_count) if (table_present or doc_present) else "-"
-
-        table_amt = _amount_cell(summary.usd_by_date, summary.total_usd, table_present)
-        doc_amt = _amount_cell(summary.doc_usd_by_date, summary.doc_total_usd, doc_present)
-
-        # Total amount across both origins.
-        if table_present or doc_present:
-            combined_by_date: dict = {}
-            for d, u in list(summary.usd_by_date.items()) + list(summary.doc_usd_by_date.items()):
-                combined_by_date[d] = combined_by_date.get(d, 0.0) + u
-            total_amt = _amount_cell(
-                combined_by_date, summary.total_usd + summary.doc_total_usd, True
-            )
-        else:
-            total_amt = "-"
-
-        rows.append((
-            display,
-            table_txns,
-            doc_txns,
-            total_txns,
-            table_amt,
-            doc_amt,
-            total_amt,
-            "; ".join(summary.table_sources) if summary.table_sources else "-",
-            "; ".join(summary.doc_sources) if summary.doc_sources else "-",
-        ))
-
-    output_writer.write_scope_txn_summary(rows, output_path)
-    logger.info("[Main] Scope txn summary written | scopes=%d | local=%s", len(rows), local_code)
+# Output F (Scope Transaction Summary) now lives in its own stage so it can be built/written and
+# debugged/regenerated independently of a full run — see src/pipeline/output_f_stage.py and
+# scripts/generate_output_f.py.
 
 
 def _build_questionnaire_records(questions) -> list[dict]:
@@ -1177,7 +1098,7 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
     # Download reference files (GL map + TPI inventory), resolve the auditor's inventory sheet,
     # and build the TPI inventory block used for the classifier's GATE B same-party recognition.
     _phase("RA_INGEST_POLICIES")
-    tpi_inventory_block = _prepare_reference_files(settings, auditor_id, llm=llm)
+    tpi_inventory_block, tpi_names = _prepare_reference_files(settings, auditor_id, llm=llm)
 
     hcbi_tool         = HcbiRetrievalTool(index_manager, settings, llm=llm)
     scope_policy_tool = ScopePolicyRetrievalTool(index_manager, settings)
@@ -1193,7 +1114,7 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
     risk_classifier_agent    = RiskClassifierAgent(llm)
     risk_writer_agent        = RiskWriterAgent(llm)
 
-    transactional_analysis_agent = TransactionalDataAnalysisAgent(llm, settings)
+    transactional_analysis_agent = TransactionalDataAnalysisAgent(llm, settings, tpi_names=tpi_names)
 
     # ── Phase 3 runs FIRST — the current-year transactional risks become pre-context for the
     #    per-question analysis (Phase 2), so responses are evaluated against current-year data.
@@ -1230,6 +1151,7 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
         transactional_context=transactional_context,
         recurrence_context=recurrence_context,
         audit_context=settings.audit_scope_context,
+        engagement_configured=bool(settings.engagement_filter_clause),
     )
     if settings.audit_scope_context:
         logger.info("[Runner] Audit context injected | %s", settings.audit_scope_context)
@@ -1320,6 +1242,9 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
                     )
                     state.risk_finding.ai_recommendation = supervisor_output.content
                     state.risk_finding.calculation_evidence = supervisor_output.calculation_evidence
+                    state.risk_finding.sql_queries = supervisor_output.sql_queries
+                    state.risk_finding.supporting_doc_names = supervisor_output.supporting_doc_names
+                    state.risk_finding.must_cite_doc_names = supervisor_output.must_cite_docs
                     state.processing_complete = True
                     completed_states.append(state)
                     completed_count += 1
@@ -1415,9 +1340,16 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
     # ── Scope transaction summary sheet (per-scope count + local/USD totals; FX per transaction date)
     logger.info("[Main] Scope transaction summary stage starting…")
     try:
-        _write_scope_txn_summary(transactional_analysis_agent, output_writer, output_path)
+        build_and_write_output_f(transactional_analysis_agent, output_writer, output_path)
     except Exception as exc:
         logger.error("[Main] Scope txn summary stage failed | error=%s", exc, exc_info=True)
+
+    # ── Output G — HCC activity types not mapped to any scope area (count + USD), own sheet
+    logger.info("[Main] Other-HCC-types (Output G) stage starting…")
+    try:
+        build_and_write_output_g(transactional_analysis_agent, output_writer, output_path)
+    except Exception as exc:
+        logger.error("[Main] Output G stage failed | error=%s", exc, exc_info=True)
 
     # ── Past Audit Report sheet — summarise the auditor's past-audit index (one row per observation)
     _phase("RA_SUMMARIZE_PAST_AUDITS")
@@ -1428,7 +1360,7 @@ async def run_audit(auditor_id: str, output_path: Path, on_phase=None) -> None:
     ))
     try:
         past_audit_agent = PastAuditSummarizerAgent(llm)
-        observations = summarize_past_audits(index_manager, past_audit_agent, auditor_id)
+        observations = summarize_past_audits(index_manager, past_audit_agent, auditor_id, llm=llm)
         output_writer.write_past_audit(observations, output_path)
         logger.info("[Main] Past Audit sheet complete | observations=%d", len(observations))
     except Exception as exc:

@@ -39,9 +39,11 @@ RULES
   correct registered spelling.
 - Output VALID JSON only: an object mapping each scope area name (EXACTLY as given, so it can be matched
   back) to an object with two keys:
-    - "label": the scope area name written out for display, with any abbreviations expanded to the full
-      form inferred from that scope's findings (keep proper names/entity/regulator titles as-is; no
-      hyphenation). If no full form is evident in the findings, repeat the name as given.
+    - "label": a SHORT display name for the scope area — at most ~6 words / ~45 characters. Expand an
+      abbreviation to its full form ONLY if that stays short (keep proper names/entity/regulator titles
+      as-is; no hyphenation). Do NOT enumerate sub-areas or list many processes: when a scope spans
+      several areas, use a brief umbrella like "Multiple compliance areas" instead of listing them all.
+      If no short full form is evident, repeat the name as given (truncated to the limit).
     - "bullets": a list of up to {max_bullets} bullet strings.
   No markdown, no prose.
 """

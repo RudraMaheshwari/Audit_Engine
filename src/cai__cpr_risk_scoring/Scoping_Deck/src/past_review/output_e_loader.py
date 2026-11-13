@@ -16,7 +16,7 @@ from src.utils.logger import get_logger
 
 from ..config import ScopingDeckConfig
 from .classifier import PastReviewClassifier
-from .models import PastReviewObservation
+from .models import PastReviewObservation, ReviewKind
 
 logger = get_logger(__name__)
 
@@ -45,12 +45,21 @@ def _year_from(value) -> int | None:
 def _to_observation(record: dict) -> PastReviewObservation:
     source_document = str(record.get("source_document") or "").strip()
     audit_report = str(record.get("audit_report") or "").strip()
+    scope_area = str(record.get("scope_area") or "").strip()
+    issue_type = str(record.get("issue_type") or "").strip()
+    issue_description = str(record.get("issue_description") or "").strip()
+    # The report identifiers (Source Document / Audit Report) are authoritative for CPR-vs-GACS, so
+    # classify on those first; only if inconclusive fall back to the rest of the row so a CPR/GACS
+    # mention anywhere still divides it (the "see the whole data" case). This ordering keeps a CPR
+    # report's finding from being mis-tagged GACS just because its description happens to name GACS.
     kind = PastReviewClassifier.classify(source_document, audit_report)
+    if kind is ReviewKind.OTHER:
+        kind = PastReviewClassifier.classify(scope_area, issue_type, issue_description)
     return PastReviewObservation(
-        scope_area=str(record.get("scope_area") or "").strip(),
-        issue_description=str(record.get("issue_description") or "").strip(),
+        scope_area=scope_area,
+        issue_description=issue_description,
         criticality=str(record.get("criticality") or "").strip(),
-        issue_type=str(record.get("issue_type") or "").strip(),
+        issue_type=issue_type,
         source_document=source_document,
         audit_report=audit_report,
         report_year=_year_from(record.get("report_date")),

@@ -54,6 +54,12 @@ Use ALL four elements together to construct your query:
 Your query must target what was CLAIMED and what evidence is EXPECTED — not the
 question text itself.
 
+MULTI-PART QUESTIONS: when the QUESTION asks for MORE THAN ONE kind of evidence (e.g. "a. the TPI
+inventory ... b. the list of red flags still under mitigation"), build ONE query whose terms cover
+EVERY distinct request — do not let a narrow follow-up about one part crowd out another explicit
+request in the question. When the RESPONSE / FOLLOW-UP RESPONSE carry no specifics (e.g. "please
+find the attached file"), draw those terms from the QUESTION's explicit asks.
+
 Examples:
   Question:  "What is your process for identifying new hires requiring HCC training?"
   Response:  "Global Services sends a weekly starters and leavers report to HCCO"
@@ -73,8 +79,9 @@ affiliation HCC review recruitment Workday pre-employment screening"
 Strategy:
 1. Read all four context elements carefully before constructing your query.
 2. Call retrieve_supporting_docs_semantic ONCE with a query built from the claims
-   and specifics in the RESPONSE and FOLLOW-UP RESPONSE (the tool handles multiple
-   query phrasings internally via MQR). Do not pass scope_id — the tool searches
+   and specifics in the RESPONSE and FOLLOW-UP RESPONSE (or, when those are generic, from the
+   QUESTION's explicit asks, covering every distinct sub-request in the SAME query). The tool
+   handles multiple query phrasings internally via MQR. Do not pass scope_id — the tool searches
    all auditor-submitted evidence without scope filtering.
 3. Scan the response and follow-up response for any explicitly named documents,
    reports, or files. If found, call retrieve_supporting_docs_targeted for each

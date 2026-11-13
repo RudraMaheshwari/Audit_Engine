@@ -169,6 +169,14 @@ class RiskFinding(BaseModel):
     validation_score: float = Field(default=0.0, ge=0.0, le=10.0)
     ai_recommendation: str = ""
     calculation_evidence: str = ""
+    sql_queries: str = ""
+    # Supporting-doc file names the SupportingDocsAgent surfaced for this question — used as the
+    # deterministic safety net so a reportable finding cites its evidence file even if the writer omits it.
+    supporting_doc_names: list[str] = Field(default_factory=list)
+    # Evidence files pulled DETERMINISTICALLY for the question's topic (e.g. the red-flag records when
+    # the question asks about red flags). These are the finding's evidence by construction, so Source
+    # Details always cites them — even when the writer describes them without the literal filename.
+    must_cite_doc_names: list[str] = Field(default_factory=list)
 
     conflicts: list[ConflictFlag] = Field(default_factory=list)
 

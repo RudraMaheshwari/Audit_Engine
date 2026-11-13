@@ -6,7 +6,6 @@ from src.utils.logger import get_logger
 
 from ..config import ScopingDeckConfig
 from .index_manager import PastReviewIndexManager
-from .models import ReviewKind
 from .output_e_loader import OutputELoader
 
 logger = get_logger(__name__)
@@ -40,11 +39,12 @@ class PastReviewIngestor:
             logger.error("[PastReview] Failed to load Output E | %s", exc)
             return 0
 
-        relevant = [o for o in observations if o.review_kind in (ReviewKind.CPR, ReviewKind.GACS)]
-        if not relevant:
-            logger.warning("[PastReview] No CPR/GACS observations found in Output E")
+        # Ingest EVERY Output E observation regardless of review kind — the index just needs to hold
+        # the full past-review set (each row keeps its review_kind, CPR/GACS/OTHER, for any later use).
+        if not observations:
+            logger.warning("[PastReview] No observations found in Output E")
             return 0
 
-        self._index.upsert(relevant, auditor_id)
-        logger.info("[PastReview] Ingested %d CPR/GACS observation(s)", len(relevant))
-        return len(relevant)
+        self._index.upsert(observations, auditor_id)
+        logger.info("[PastReview] Ingested %d observation(s) from Output E", len(observations))
+        return len(observations)

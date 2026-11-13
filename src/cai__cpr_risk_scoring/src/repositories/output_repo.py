@@ -36,18 +36,26 @@ _AMOUNT_RE = re.compile(
 )
 
 
-def _apply_bold(text):
+def _apply_bold(text, amount_fallback: bool = True):
     """Return CellRichText with bold applied.
 
     Primary: bold anything wrapped in **...**  (LLM-generated markers).
-    Fallback: if no markdown markers found, bold monetary/numeric amounts via regex.
+    Fallback (only when amount_fallback=True): if no markdown markers found, bold monetary/numeric
+    amounts via regex. With amount_fallback=False (markdown-only mode) an unpaired/stray '**' is
+    stripped so no literal asterisks ever reach the cell, and amounts are left untouched.
     Returns plain string when rich-text is unsupported or no bold targets exist.
     """
     text = _xml_safe(text)
-    if not text or not _RICH_TEXT_OK:
+    if not text or not _RICH_TEXT_OK or not isinstance(text, str):
         return text
 
-    use_re = _MARKDOWN_BOLD_RE if _MARKDOWN_BOLD_RE.search(text) else _AMOUNT_RE
+    if _MARKDOWN_BOLD_RE.search(text):
+        use_re = _MARKDOWN_BOLD_RE
+    elif amount_fallback:
+        use_re = _AMOUNT_RE
+    else:
+        # Markdown-only mode, no paired markers → strip any stray '**' so no literal markers show.
+        return text.replace("**", "") if "**" in text else text
 
     # Build the runs, SKIPPING any empty run. An empty plain segment or an empty bold (e.g. the LLM
     # emitting "****") writes an empty <r><t></t></r>, which makes Excel "repair String properties"
@@ -85,6 +93,7 @@ def _format_source_details(text: str) -> str:
     if not text or "Source:" not in text:
         return text
     entries = []
+    seen: set[str] = set()
     for part in re.split(r"(?=Source:)", text):
         part = re.sub(r"^[\s•|;]+", "", part)
         part = re.sub(r"[\s•|;]+$", "", part)
@@ -103,12 +112,27 @@ def _format_source_details(text: str) -> str:
             flags=re.IGNORECASE,
         )
         part = part.rstrip(";").strip()
-        if part.startswith("Source:"):
-            entries.append("• " + part)
+        if not part.startswith("Source:"):
+            continue
+        # De-duplicate: the SAME citation must appear only once even if the model repeated it across
+        # bullets. Supporting-Evidence files carry no section/page, so key them on the file name alone;
+        # everything else keys on the whole (whitespace/case-normalised) entry so distinct policy
+        # sections/pages of the same file are preserved.
+        low = " ".join(part.lower().split())
+        if low.startswith("source: supporting evidence"):
+            m = re.search(r"file name:\s*([^;]+)", low)
+            key = "supporting::" + m.group(1).strip() if m else low
+        else:
+            key = low
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append("• " + part)
     return "\n".join(entries) if entries else text
 
 from src.config.constants import (
     CATEGORY_RANK,
+    DASHBOARD_WORKFLOW_NAMES,
     EXCEL_MAX_ROW_HEIGHT,
     SHEET_A_NAME,
     SHEET_B_NAME,
@@ -116,6 +140,7 @@ from src.config.constants import (
     SHEET_D_NAME,
     SHEET_E_NAME,
     SHEET_F_NAME,
+    SHEET_G_NAME,
 )
 from src.models.schemas import OutputRow, RiskLevel, ScopeAreaSummary
 
@@ -200,6 +225,21 @@ def _rationale_with_category(row: OutputRow) -> str:
 # misrepresent the query).
 _NO_DATE_NORMALIZE = {"sql_queries"}
 
+# Raw dashboard table references (bare or schema/catalog-qualified, e.g. "cpr__gld.gld__hcc_dashboar__cpr")
+# that the NL-to-SQL agent leaves in its Calculation-Evidence prose. They are rewritten to the friendly
+# workflow name ("HCC", "Revenue", …) so the Calc-Evidence column shows the SAME names as Source Details.
+# Only a KNOWN table maps; an unknown token is left untouched. The exact, runnable SQL lives in the
+# separate SQL-Queries column, so this display-only rewrite never affects reproducibility.
+_CALC_TABLE_RE = re.compile(r"(?:[A-Za-z0-9_]+\.)*`?(gld__[A-Za-z0-9_]+__cpr)`?", re.IGNORECASE)
+
+
+def _normalize_calc_tables(text: str) -> str:
+    if not text:
+        return text
+    return _CALC_TABLE_RE.sub(
+        lambda m: DASHBOARD_WORKFLOW_NAMES.get(m.group(1).lower(), m.group(0)), text
+    )
+
 
 def _stack_bilingual(english: str, local: str | None) -> str:
     """Output A bilingual cell: the English answer, then the local-language rendering below it. Returns
@@ -232,6 +272,8 @@ def _cell_value(row: OutputRow, attr: str):
         return round(raw, 2)
     text = str(raw)
     text = text if attr in _NO_DATE_NORMALIZE else normalize_dates(text)
+    if attr == "calculation_evidence":
+        text = _normalize_calc_tables(text)
     # Output A only: Risk Description is rendered bilingually when a local translation exists.
     if attr == "risk_description":
         return _stack_bilingual(text, getattr(row, "risk_description_local", None))
@@ -293,7 +335,11 @@ def _agg_cell_value(risk, attr: str):
     if hasattr(raw, "strftime"):
         return format_date(raw)
     text = str(raw)
-    return text if attr in _NO_DATE_NORMALIZE else normalize_dates(text)
+    if attr not in _NO_DATE_NORMALIZE:
+        text = normalize_dates(text)
+    if attr == "calculation_evidence":
+        text = _normalize_calc_tables(text)
+    return text
 
 
 class OutputRepository:
@@ -483,7 +529,7 @@ class OutputRepository:
             color = _category_fill(risk.risk_category)
             fill = PatternFill("solid", fgColor=color) if color else None
             for col_idx, value in enumerate(values, start=1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=_xml_safe(value))
+                cell = ws.cell(row=row_idx, column=col_idx, value=_apply_bold(value, amount_fallback=False))
                 if fill is not None:
                     cell.fill = fill
                 cell.border = _BORDER
@@ -513,7 +559,7 @@ class OutputRepository:
                     val = format_date(val)
                 elif isinstance(val, str):
                     val = normalize_dates(val)
-                cell = ws.cell(row=position + 1, column=col_idx, value=_xml_safe(val))
+                cell = ws.cell(row=position + 1, column=col_idx, value=_apply_bold(val, amount_fallback=False))
                 cell.border = _BORDER
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
             ws.row_dimensions[position + 1].height = EXCEL_MAX_ROW_HEIGHT
@@ -540,9 +586,9 @@ class OutputRepository:
             ("Transactions — Transactional Tables", 18),
             ("Transactions — Supporting Docs", 18),
             ("Total Transactions", 16),
-            ("Amount — Transactional Tables (Local / USD)", 40),
-            ("Amount — Supporting Docs (Local / USD)", 38),
-            ("Total Amount (Local / USD)", 40),
+            ("Amount — Transactional Tables (USD)", 30),
+            ("Amount — Supporting Docs (USD)", 28),
+            ("Total Amount (USD)", 24),
             ("Transactional Table Source(s)", 30),
             ("Supporting-Doc Source(s)", 30),
         ]
@@ -557,12 +603,46 @@ class OutputRepository:
 
         for position, row in enumerate(rows, start=2):
             for col_idx, value in enumerate(row, start=1):
-                cell = ws.cell(row=position, column=col_idx, value=_xml_safe(value))
+                cell = ws.cell(row=position, column=col_idx, value=_apply_bold(value, amount_fallback=False))
                 cell.border = _BORDER
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
 
         self._atomic_save(path)
         logger.info("Scope Txn Summary sheet written to %s (%d scope areas)", path, len(rows))
+
+    def write_other_hcc_types(self, rows: list[tuple], output_path) -> None:
+        """Write Output G — HCC activity types NOT mapped to any scope area.
+
+        `rows` = list of 3-tuples (activity_type, transactions, total_amount_usd_str). A grand-total row
+        is appended. '-'/empty handled by the caller."""
+        path = Path(output_path)
+        self._ensure_workbook(path)
+        if SHEET_G_NAME in self._wb.sheetnames:
+            del self._wb[SHEET_G_NAME]
+        ws = self._wb.create_sheet(SHEET_G_NAME)
+
+        headers = [
+            ("HCC Activity Type (unmapped)", 46),
+            ("Transactions", 16),
+            ("Total Amount (USD)", 24),
+        ]
+        for col_idx, (label, width) in enumerate(headers, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=label)
+            cell.fill = _HEADER_FILL
+            cell.font = _HEADER_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = _BORDER
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
+        ws.freeze_panes = "A2"
+
+        for position, row in enumerate(rows, start=2):
+            for col_idx, value in enumerate(row, start=1):
+                cell = ws.cell(row=position, column=col_idx, value=_apply_bold(value, amount_fallback=False))
+                cell.border = _BORDER
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        self._atomic_save(path)
+        logger.info("Other HCC Types sheet written to %s (%d activity types)", path, len(rows))
 
     def _write_output_b(self, ws, summary: ScopeAreaSummary) -> None:
         rows = [
@@ -583,7 +663,7 @@ class OutputRepository:
             label_cell.font = Font(bold=True)
             label_cell.fill = PatternFill("solid", fgColor="D6E4F0")
             label_cell.border = _BORDER
-            val_cell = ws.cell(row=row_idx, column=2, value=_xml_safe(str(value)))
+            val_cell = ws.cell(row=row_idx, column=2, value=_apply_bold(str(value), amount_fallback=False))
             val_cell.alignment = Alignment(wrap_text=True, vertical="top")
             val_cell.border = _BORDER
         ws.column_dimensions["A"].width = 25

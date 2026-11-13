@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
@@ -14,7 +14,7 @@ from src.agents.risk_evaluation_agent import RiskEvaluationAgent
 from src.agents.risk_writer_agent import RiskWriterAgent
 from src.agents.scope_identifier_agent import ScopeIdentifierAgent
 from src.agents.supporting_docs_agent import SupportingDocsAgent
-from src.agents.transactional_data_agent import TransactionalDataAgent
+from src.agents.transactional_data_agent import SqlQueryCaptureHandler, TransactionalDataAgent
 from src.config.constants import (
     AGENT_HCBI_POLICY,
     AGENT_POLICY_KNOWLEDGE,
@@ -34,7 +34,7 @@ from src.config.constants import (
     SCOPE_UNFILTERED_LABEL,
 )
 from src.observability.tracing import observe
-from src.scoring import is_further_review, reconcile_category
+from src.scoring import downgrade_to_further_review, is_further_review, reconcile_category
 from src.scoring.risk_matrix import band_confidence
 from src.utils.logger import get_logger
 
@@ -57,6 +57,9 @@ class SupervisorResult:
     derived_confidence: float | None = None
     transactional_invoked: bool = False
     calculation_evidence: str = ""
+    sql_queries: str = ""
+    supporting_doc_names: list = field(default_factory=list)
+    must_cite_docs: list = field(default_factory=list)   # deterministically-pulled topic evidence
 
 # Prompt-registry keys per agent (used to stamp prompt_name/version/hash onto each LLM call).
 _PROMPT_HCBI          = "hcbi_retrieval"
@@ -94,6 +97,44 @@ _QUANT_INTENT = re.compile(
 )
 
 
+_SUPPORTING_DOC_TAG_RE = re.compile(r"\[([^\]|]+?)\s*\|\s*(?:score=|SEMANTIC|TARGETED)", re.IGNORECASE)
+
+
+def _supporting_doc_names(supporting_ctx: str) -> list[str]:
+    """Extract the supporting-doc file names the SupportingDocsAgent surfaced, from its
+    '[<document_name> | score=…/SEMANTIC/TARGETED]' evidence tags. Order-preserving, unique."""
+    seen: list[str] = []
+    for m in _SUPPORTING_DOC_TAG_RE.finditer(supporting_ctx or ""):
+        name = m.group(1).strip()
+        if name and name.lower() not in ("no supporting evidence found", "none") and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _split_calc_sql(agent_output: str, exact_block: str) -> tuple[str, str]:
+    """Split the transactional agent's output into (calculation_evidence, sql_queries).
+
+    The agent prose is Calculation / Tables / Status / [Queries] / Limitations. SQL belongs in the
+    SQL-Queries column, not the Calc-Evidence column — so lift the agent's inline 'Queries:' section
+    out of the prose and send the EXACT executed SQL (preferred) to the SQL column. Everything else
+    (results + Limitations) stays in the calc-evidence column."""
+    text = (agent_output or "").strip()
+    agent_sql = ""
+    m = re.search(r"(?i)\n\s*Queries?\s*:", text)
+    if m:
+        head = text[:m.start()].rstrip()
+        rest = text[m.start():]
+        lm = re.search(r"(?i)\n\s*Limitations?\s*:", rest)
+        if lm:
+            agent_sql = rest[:lm.start()].strip()
+            text = (head + "\n\n" + rest[lm.start():].lstrip("\n")).strip()
+        else:
+            agent_sql = rest.strip()
+            text = head.strip()
+    sql = (exact_block or "").strip() or agent_sql
+    return text, sql
+
+
 class AuditSupervisor:
     """
     Orchestrates the FCPA audit pipeline for a single question (scope-after-analysis):
@@ -121,15 +162,21 @@ class AuditSupervisor:
         transactional_context: str = "",
         recurrence_context: str = "",
         audit_context: str = "",
+        engagement_configured: bool = True,
     ) -> None:
         self._tpi_inventory_block = tpi_inventory_block
         self._transactional_context = transactional_context
         self._recurrence_context = recurrence_context
         self._audit_context = audit_context
+        # Whether this run has an audit-population (engagement) filter configured. When it is NOT, any
+        # transactional evidence the NL->SQL agent returns is UNSCOPED (spans all audits), so it cannot
+        # support a scored transactional risk — the calc-evidence gate treats it as unverified.
+        self._engagement_configured = engagement_configured
         self._scope_id    = scope_identifier_agent.get_agent()
         self._hcbi        = hcbi_policy_agent.get_agent()
         self._policy      = policy_knowledge_agent.get_agent()
         self._supporting  = supporting_docs_agent.get_agent()
+        self._supporting_agent = supporting_docs_agent   # for the deterministic red-flag supplement
         self._risk_eval   = risk_evaluation_agent.get_agent()
         self._transact    = transactional_data_agent.get_agent()
         self._risk_anal   = risk_classifier_agent.get_agent()
@@ -216,6 +263,15 @@ class AuditSupervisor:
         hcbi_ctx       = hcbi_out["messages"][-1].content
         policy_ctx     = policy_out["messages"][-1].content
         supporting_ctx = supporting_out["messages"][-1].content
+        # Deterministic red-flag/mitigation evidence top-up (independent of the ReAct agent's query),
+        # so a multi-part question's red-flag part is never dropped. No-op unless the question asks for it.
+        rf_supplement = await self._supporting_agent.red_flag_supplement(question_text, followup_question)
+        if rf_supplement:
+            supporting_ctx = f"{supporting_ctx}\n\n{rf_supplement}"
+        surfaced_supporting_docs = _supporting_doc_names(supporting_ctx)
+        # The files the deterministic supplement pulled ARE this question's evidence by construction —
+        # the output writer cites them in Source Details regardless of how the writer phrased the prose.
+        must_cite_docs = _supporting_doc_names(rf_supplement) if rf_supplement else []
 
         # ── Phase B — analysis is scope-agnostic (no scope label injected)
         eval_msg = (
@@ -234,19 +290,31 @@ class AuditSupervisor:
         risk_eval_ctx = risk_eval_out["messages"][-1].content
 
         transactional_ctx = ""
-        run_transactional = self._is_transactional(risk_eval_ctx)
-        # Run the agent when EITHER the response carries a numeric/currency signal OR the question
-        # itself is quantitative/transactional in intent (e.g. "how much…", discounts/credit notes).
-        # The latter ensures calc evidence (Col J) is produced even for terse responses like "Zero".
-        quantitative = (
+        agent_output = ""   # the agent's prose (Calculation/Tables/Status/Limitations) → calc-evidence column
+        exact_block = ""    # the exact executed SQL → SQL-Queries column
+        # Decide whether THIS question runs the NL-to-SQL agent. Two independent triggers, so a figure
+        # is never borrowed from the Phase-3 context without being recomputed here:
+        #   • question_quant — a clear transactional/quantitative signal in THIS question or response
+        #     (currency/number, or intent like "how much…", discounts, rebates, credit notes, payments).
+        #     This FORCES a run on its own, even if risk-eval did not flag transactional intent.
+        #   • risk-eval flagged transactional intent — then run, UNLESS nothing quantitative exists
+        #     anywhere (question/response or the injected Phase-3 context) to validate.
+        # The Phase-3 context carries amounts for DIRECTION only; it keeps a risk-eval-flagged question
+        # from being skipped, but (being identical across questions) it never forces a run by itself.
+        question_quant = (
             self._has_quantitative_signal(response_text, followup_response)
             or self._has_quantitative_signal(question_text, followup_question)
             or bool(_QUANT_INTENT.search(f"{question_text}\n{followup_question}"))
         )
-        if run_transactional and not quantitative:
+        context_quant = self._has_quantitative_signal(self._transactional_context)
+        run_transactional = self._is_transactional(risk_eval_ctx)
+        if question_quant:
+            run_transactional = True   # strong per-question signal → always validate via NL->SQL
+        elif run_transactional and not context_quant:
             logger.info(
-                "[AuditSupervisor] Transactional flag set but neither response nor question has a "
-                "quantitative/transactional signal — skipping transactional agent (deterministic guard)"
+                "[AuditSupervisor] Transactional flag set but neither the question/response nor the "
+                "transactional context has a quantitative signal — skipping transactional agent "
+                "(deterministic guard)"
             )
             run_transactional = False
         if run_transactional:
@@ -258,10 +326,14 @@ class AuditSupervisor:
                 "quantitative statements in the response above."
             )
             trans_out: dict | None = None
+            sql_capture: SqlQueryCaptureHandler | None = None
             for _attempt in range(1, MAX_TRANS_RETRIES + 1):
                 try:
+                    sql_capture = SqlQueryCaptureHandler()
                     with observe(agent_name=AGENT_TRANSACTIONAL, prompt_name=_PROMPT_TRANSACTIONAL):
-                        trans_out = await self._transact.ainvoke({"input": trans_input})
+                        trans_out = await self._transact.ainvoke(
+                            {"input": trans_input}, config={"callbacks": [sql_capture]},
+                        )
                     transactional_ctx = trans_out.get("output", "")
                     # LangChain returns a sentinel like "Agent stopped due to max iterations." when the
                     # SQL agent exhausts its step budget — replace that with a clean, professional line.
@@ -281,11 +353,16 @@ class AuditSupervisor:
                     "treating as No Risk for transactional component",
                     MAX_TRANS_RETRIES,
                 )
-            # Append the EXACT tables + SQL the agent actually ran (read from intermediate steps), so the
-            # calc evidence (Col J) always carries the real table names and queries — independent of what
-            # the LLM wrote in its prose answer.
-            if transactional_ctx and trans_out is not None:
-                exact_block = TransactionalDataAgent.build_exact_tables_block(trans_out)
+            # Append the EXACT tables + SQL the agent actually ran, so the calc evidence (Col J) always
+            # carries the real table names and queries — independent of what the LLM wrote in its prose.
+            # PREFER the callback capture (version-robust: works even when return_intermediate_steps is
+            # not forwarded to the AgentExecutor); fall back to parsing intermediate_steps.
+            if transactional_ctx:
+                agent_output = transactional_ctx   # keep the prose separately (for the calc column)
+                if sql_capture is not None:
+                    exact_block = TransactionalDataAgent.build_tables_block_from_calls(sql_capture.calls)
+                if not exact_block and trans_out is not None:
+                    exact_block = TransactionalDataAgent.build_exact_tables_block(trans_out)
                 if exact_block:
                     transactional_ctx = f"{transactional_ctx}\n\n{exact_block}"
 
@@ -315,6 +392,29 @@ class AuditSupervisor:
             classification_ctx[:120].replace("\n", " "),
         )
 
+        # ── HARD CALC-EVIDENCE GATE ─────────────────────────────────────────────────────────────
+        # A scored transactional/quantitative risk is only valid when it is backed by captured,
+        # audit-scoped calculation evidence (classifier gate: calc rows + a population validated to this
+        # audit's engagement). That gate is advisory in the prompt and the model can violate it — e.g.
+        # scoring a books-and-records risk from the response narrative with the Calc-Evidence column
+        # blank, or on UNSCOPED (cross-audit) numbers. Enforce it here in code: when the transactional
+        # agent was meant to run (transactional/quantitative intent) but produced NO calc evidence, or
+        # the run was not scoped to an engagement, the matrix must NOT apply → Further Review Required.
+        calc_verified = bool((transactional_ctx or "").strip()) and self._engagement_configured
+        if run_transactional and matrix_score is not None and not calc_verified:
+            reason = (
+                "no audit-scoped transactional calculation evidence was captured"
+                if not (transactional_ctx or "").strip()
+                else "transactional evidence was not scoped to this audit's engagement number"
+            )
+            logger.warning(
+                "[AuditSupervisor] Calc-evidence gate fired — downgrading scored '%s' to Further "
+                "Review Required | reason=%s",
+                (matrix_score.category if matrix_score else "?"), reason,
+            )
+            classification_ctx = downgrade_to_further_review(classification_ctx, reason)
+            matrix_score = None
+
         # ── Scope categorisation AFTER analysis — assign FCPA scope(s) to the identified
         #    risk (never before/for retrieval). Multi-scope only when the agent is confident.
         assigned_scopes, scope_conf = await self._assign_scope_after_analysis(
@@ -340,6 +440,9 @@ class AuditSupervisor:
             "[AuditSupervisor] Done | scope=%s | response_length=%d",
             scope_label, len(final_content),
         )
+        # Split the transactional output across TWO output columns: the prose/results go to the
+        # Calculation Evidence column, the executed SQL goes to the SQL Queries column.
+        calc_evidence, sql_queries = _split_calc_sql(agent_output, exact_block)
         return SupervisorResult(
             content=final_content,
             assigned_scope=scope_label,
@@ -357,7 +460,10 @@ class AuditSupervisor:
             llm_confidence=scope_conf,
             derived_confidence=(band_confidence(matrix_score.score) if matrix_score else None),
             transactional_invoked=run_transactional,
-            calculation_evidence=transactional_ctx,
+            calculation_evidence=calc_evidence,
+            sql_queries=sql_queries,
+            supporting_doc_names=surfaced_supporting_docs,
+            must_cite_docs=must_cite_docs,
         )
 
     _CONFIDENCE_HIGH     = SCOPE_CONFIDENCE_HIGH      # additional scopes assigned only at/above this

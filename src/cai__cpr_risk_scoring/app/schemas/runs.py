@@ -147,6 +147,10 @@ class RunStatus(BaseModel):
     api: ApiName
     auditor_id: str
     state: RunState
+    # Human-readable LIVE status for the current step (what a UI shows while polling) — e.g. "Reviewing
+    # supporting documents" while RUNNING, "Completed"/"Failed"/"Queued" otherwise. Mirrors status_code/
+    # label; those stay for the machine-readable phase code.
+    current_status: str | None = None
     status_code: str | None = None
     label: str | None = None
     progress: Progress | None = None

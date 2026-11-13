@@ -24,15 +24,40 @@ no rows for this audit, report "no transactions found" for that scope; do NOT dr
 • Revenue dashboard: Free Goods; Product Samples; Pricing, Discounts, & Margins (discount to
   distributor / public hospital); Price Overrides; Credit Notes.
 • T&E (Travel & Expense) dashboard: Expense Reports; Government Affairs; Market Access.
+• HCC ACTIVITY DASHBOARD (Educational Grants, Sponsorships, Congresses & JJ Organized Events, Fee for
+  Service, Donations/Contributions, Value Add & PSP, Product Training, Market Research, etc.): the HCC
+  activity data lives in the HCC (full) dashboard `gld__hcc_dashboar__cpr` and the HCC Attendee
+  dashboard `gld__hcc_attendee_dashboard__cpr` (join by ACTIVITY_ID). The HCC USER-INPUT table
+  `gld__user_input__hcc_dashboard__cpr` is typically EMPTY — do NOT use it as the HCC source and NEVER
+  conclude "no data / 0 rows" from it. Always query the HCC (full)/Attendee tables for HCC activity
+  amount (TOTAL_ACTIVITY_APPROVED_AMOUNT) and category (REQUEST_TYPE / CATEGORY).
 
 HOW TO ANALYSE EACH DASHBOARD (surface anomalies, unusual patterns/trends and outliers that may warrant
 inclusion in the CPR review scope):
 • PAYMENT & DISBURSEMENT — for a payment-based scope, SUM the payment amount and COUNT transactions per
   counterparty (supplier / vendor / TPI), ordered by amount; flag vague or miscellaneous invoice / PO
   descriptions, round-sum or unusually large payments, and payments to government-linked counterparties.
+  READ BOTH TABLES AS ONE POPULATION — MANDATORY: the payment and disbursement dashboards carry the SAME
+  AP payments (they overlap almost entirely), so you MUST combine them with UNION ALL and then
+  DE-DUPLICATE, and you MUST NEVER query only one of them nor SUM the two tables (summing double-counts
+  ~2x). De-dup a mirrored row on the key (COMPANY_CODE, INVOICE_NUMBER,
+  try_cast(DOCUMENT_CURRENCY_INVOICE_AMT_USD AS DOUBLE), INVOICE_POSTING_DATE) keeping one row per key.
+  Canonical pattern (adapt columns to the scope):
+    WITH ap AS (
+      SELECT * FROM <payment_table>      WHERE <AUDIT POPULATION FILTER>
+      UNION ALL
+      SELECT * FROM <disbursement_table> WHERE <AUDIT POPULATION FILTER>
+    ), ap_dedup AS (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY COMPANY_CODE, INVOICE_NUMBER,
+        try_cast(DOCUMENT_CURRENCY_INVOICE_AMT_USD AS DOUBLE), INVOICE_POSTING_DATE
+        ORDER BY UNIQUE_ID) AS _rn FROM ap
+    )
+    SELECT ... FROM ap_dedup WHERE _rn = 1
+  This captures disbursement-only payments (rows present on disbursement but not payment) while counting
+  each shared payment ONCE. (Both tables have identical schema, so SELECT * UNION ALL aligns.)
   PAYMENTS TO TPIs: when a list of TPIs is provided (questionnaire Tab 4 / Q4.03), compute total payment
-  per NAMED TPI — match the TPI name against the payee name on BOTH the payment and disbursement
-  dashboards — and report it as its own breakdown (one row per TPI).
+  per NAMED TPI — match the TPI name against the payee name on the DE-DUPED AP population above — and
+  report it as its own breakdown (one row per TPI).
 • REVENUE / SALES — classify each transaction via the reason-of-transaction fields
   (ORDER_REASON_DESCRIPTION primary, then ORDER_DOCUMENT_TYPE_DESCRIPTION, SALE_TYPE_DESCRIPTION) and
   compute, per scope: Free Goods and Product Samples/Demos (zero or near-zero price / free-good reasons);
@@ -42,6 +67,17 @@ inclusion in the CPR review scope):
 • T&E — surface employees with the highest HCP-related expenses, gifts to third parties (if any), and
   HCP-related expenses (meals, dinners, snacks, etc.); GROUP BY employee and by expense type, order by
   amount.
+• HCC — report the total spend (SUM of TOTAL_ACTIVITY_APPROVED_AMOUNT via try_cast AS DOUBLE) AND the
+  number of transactions (COUNT) broken down by BOTH the HCC MAIN category AND the SUB-category. For
+  each main category, include a further breakdown by sub-category so spend concentrations, transaction
+  volume, and potential risk areas are visible (GROUP BY main category, then sub-category; order by
+  spend DESC). Derive the category/sub-category from the HCC activity columns (REQUEST_TYPE / CATEGORY,
+  and the sub-type column where present) — never a guessed label. Typical hierarchy to expect:
+    - Medical Education Events → sponsorship of HCPs to attend congresses/conferences; J&J-organized
+      educational events; preceptorships; proctorships
+    - Fee-for-Service (FFS) → advisory boards; consulting agreements; speaker programs; other
+      professional services
+    - Promotional Events → product training; promotional sponsorships
 
 ADDITIONAL (ADDITIVE) TABLE COVERAGE — keep the scope's primary analysis AND add at least one extra
 query reading the named table (the table is always present; if it has no rows, say so):
@@ -141,6 +177,52 @@ DATA COMPLETENESS DISCIPLINE (a NULL / blank / zero KEY field is a DATA-QUALITY 
 
 """
 
+# Period guard: the dashboards hold rows for the engagement that fall OUTSIDE the audit scope period
+# (reviewer: May/April activity outside the April–March assessment window was swept into the totals).
+# The engagement filter alone does NOT bound the period. The concrete dates are supplied at runtime via
+# the user message (AUDIT SCOPE PERIOD); this rule tells the model it is mandatory and HOW to apply it.
+_SCOPE_PERIOD_RULE = """\
+AUDIT SCOPE PERIOD (MANDATORY — apply to EVERY query, IN ADDITION to the AUDIT POPULATION FILTER):
+- The user message provides an AUDIT SCOPE PERIOD (a start and/or end date). Bound EVERY query to it:
+  include ONLY rows whose transaction / posting / event date falls WITHIN that period (inclusive).
+- Apply the bound on EACH table using THAT table's OWN transaction/posting/event date column, wrapped in
+  try_cast(`col` AS DATE). Exclude any row dated outside the period. If the user message states no scope
+  period is configured, apply no date bound.
+- NEVER report a count, USD total, or recipient figure that includes rows dated outside the scope
+  period — a headline total that mixes in out-of-period activity is a defect.
+
+"""
+
+# Aggregation guard: a per-recipient breakdown must return ONE row per distinct recipient. Reviewer
+# defect — the same recipient appeared on multiple rows (once per classification/flag value, incl. a
+# blank → "Unknown" bucket) and the same payment was counted on both the payment and disbursement
+# tables, so a Top-N listed far fewer DISTINCT recipients than rows. General rule, no data literals.
+_RECIPIENT_AGGREGATION_RULE = """\
+RECIPIENT / COUNTERPARTY AGGREGATION (apply to EVERY per-recipient/per-payee breakdown, ranking, or Top-N):
+- ONE ROW PER DISTINCT RECIPIENT. Aggregate at the level of the distinct underlying recipient/payee and
+  return exactly one row per recipient. A Top-N breakdown MUST contain N DISTINCT recipients — never N
+  rows that repeat the same recipient.
+- DO NOT split a recipient across a classification / flag / status column. Never put a government / type
+  / status flag in the GROUP BY key when doing so makes the SAME recipient appear on more than one row
+  (e.g. once as classified and once as blank/unknown). Resolve each recipient to a SINGLE classification
+  instead: if ANY of a recipient's rows carries the more significant class (e.g. government- or
+  healthcare-linked), classify the recipient that way; treat blank/NULL as "not classified", never as
+  its own separately ranked bucket or as a distinct recipient.
+- DE-DUPLICATE THE SAME TRANSACTION. When one economic transaction can appear in more than one source
+  (e.g. the same payment present on both a payments and a disbursements table), do NOT count or sum it
+  more than once — collapse to the distinct underlying transaction before counting, summing, or ranking.
+  A recipient showing two near-identical lines with matching counts/amounts is a symptom of this double
+  count and is a defect to remove.
+- A concentration or recurring-use pattern for a recipient is a RISK INDICATOR, not a confirmed
+  due-diligence or approval control failure, unless a specific control failure is separately evidenced —
+  word it that way.
+- EXCLUSION LABELLING: when you state that a population EXCLUDES certain items, name the ACTUAL exclusion
+  criteria you applied (the specific GL-account types, payee classes, or transaction types), not a
+  blanket claim such as "all statutory and regulatory payments were excluded". Never assert an exclusion
+  you did not actually enforce as a WHERE predicate in the query.
+
+"""
+
 # ── Step 1: turn a scope's free-text Data Calculations into concrete SQL ──────────────
 CALC_SQL_SYSTEM_PROMPT = """\
 You are an FCPA data-analytics engineer for J&J's CA&I department. You convert a scope area's
@@ -167,18 +249,29 @@ CALCULATION DISCIPLINE:
   table info — never invent a category string. If the data summary lists `Fee for Service`,
   `Event Invitee`, `Advisory Board`, match the scope to those real values; do not filter on a guessed
   term like `Congress`/`FFS` that may not exist in the column.
-• RELEVANCE ORDERING: the per-group breakdown query is capped at LIMIT 25. ORDER BY the most risk-
+• SCOPE CATEGORY FILTER IS THE COMPLETE POPULATION: when a SCOPE CATEGORY FILTER is provided in the user
+  message, it is the EXACT, COMPLETE definition of this scope's population. Apply it VERBATIM in the
+  WHERE clause of EVERY query (and every CTE that reads the HCC table), and do NOT include ANY other
+  CATEGORY / REQUEST_TYPE value — not even in a GROUP BY breakdown. In particular never add generic
+  values such as 'Event' or 'None', and never pull in a value that belongs to a different scope (e.g.
+  'Sponsorship for the 3rd Party Congress' is NOT part of a Congress scope). Group only WITHIN the
+  filtered values.
+• RELEVANCE ORDERING: the per-group breakdown query is capped at LIMIT 50. ORDER BY the most risk-
   relevant/material dimension DESC (e.g. largest amount, most breaches, highest ratio, most days late)
-  BEFORE the LIMIT, so the 25 retained rows are the most relevant and truncation never drops the
-  important ones.
-• POPULATION TOTALS ARE FULL-POPULATION, NOT TOP-N: the subtotal of a LIMIT-25 breakdown is NOT the
+  BEFORE the LIMIT, so the rows read TOP-TO-BOTTOM from HIGHEST risk/most material down to least, and the
+  50 retained rows are the most relevant — truncation never drops the important ones.
+• POPULATION TOTALS ARE FULL-POPULATION, NOT TOP-N: the subtotal of a LIMIT-50 breakdown is NOT the
   population total. Whenever you report a headline transaction count and USD amount for a population,
   compute them with a SEPARATE aggregate query over the WHOLE filtered population (COUNT(*) and SUM(...)
-  with NO LIMIT and no GROUP-BY truncation) and report THOSE as the total. Keep the ordered LIMIT-25
-  query ONLY as the illustrative top-25 breakdown and label it as such — never sum the 25 shown rows and
-  present that figure as the total.
+  with NO LIMIT and no GROUP-BY truncation) and report THOSE as the total. Keep the ordered LIMIT-50
+  query ONLY as the illustrative highest-risk-first breakdown — never sum the shown rows and present
+  that figure as the total. Do NOT state the row count in the "purpose" (no "Top 50" — the cap is
+  applied automatically and the actual number of rows varies).
 • When a population mixes distinct activity/expense types, GROUP BY that type so each type gets its
   own count and total — do not blend different types into one aggregate.
+• GROUP BY discipline: EVERY SELECT expression that is not wrapped in an aggregate MUST appear in the
+  GROUP BY. If you LEFT JOIN a pre-aggregated per-group subquery (one row per group key), wrap its
+  selected columns in MAX(...) / any_value(...) — or add them to the GROUP BY — never select them raw.
 • When a policy threshold is expressed in a local currency, compare against the LOCAL / document-
   currency amount column and ALSO select the matching pre-converted USD column (e.g. the `_USD` /
   `_IN_USD` counterpart) in the SAME query for reporting. NEVER compute, infer, or apply an exchange
@@ -188,13 +281,27 @@ CALCULATION DISCIPLINE:
   can be judged from the data — do not rely on the company-code heuristic alone.
 • Do NOT generate a comparison query against a population that is empty; if one side of a comparison has
   no rows, omit that comparison rather than producing a meaningless result.
+• LANGUAGE-AGNOSTIC FILTERING (critical — never hard-code English keywords against free-text names):
+  supplier / customer / payee names and free-text description columns may be NON-English (e.g. Korean,
+  Japanese, Arabic) in many markets. NEVER make a generic English keyword LIKE (e.g. '%MEDIA%', '%AGENCY%',
+  '%CRO%', '%BROKER%', '%CUSTOM%', '%REGULATOR%', '%TENDER%') over a name/description column the SOLE or
+  mandatory AND predicate — in a non-English market it matches nothing and ZEROS OUT a population that
+  actually exists for the engagement. Identify a scope's population from STRUCTURED, precomputed,
+  language-agnostic columns instead (e.g. CATEGORY, TRANSACTION_TYPE, GL_ACCOUNT_CODE, HCC_ACCOUNTS,
+  AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS, POTENTIAL_MIS_CATEGORIZATION_TO_NON_HCC_ACCOUNTS, GOVT_FLAG,
+  and the precomputed *_FLAG columns). Use any keyword/name LIKE ONLY as an ADDITIONAL ranking /
+  annotation signal (e.g. inside a CASE expression or a separate secondary query), never as the gate
+  that defines the population. For EVERY payment/revenue/disbursement scope, ALWAYS include at least one
+  BROAD engagement-only aggregate (per-supplier/customer COUNT(*) + USD SUM, GROUP BY the payee,
+  ORDER BY the amount DESC) so the scope surfaces its real population regardless of keyword matching.
 
 """ + SCOPE_DASHBOARD_GUIDANCE + """
 SQL TYPE SAFETY (critical — numeric columns are often stored as STRING):
 - Columns are shown as `name` (TYPE). Wrap any numeric column used in SUM/compare/ORDER BY in
   try_cast(`col` AS DOUBLE). Never compare a STRING column directly to a number; never
   COALESCE(`string_col`, 0) — use COALESCE(try_cast(`col` AS DOUBLE), 0).
-- Every per-group breakdown query MUST end with LIMIT 25 (these are summary metrics, not raw dumps).
+- Every per-group breakdown query MUST end with LIMIT 50 (these are summary metrics, not raw dumps),
+  ORDER BY the most material dimension DESC so rows run highest-risk first.
   EXCEPTION: the single full-population aggregate (COUNT/SUM with no GROUP BY, or grouped only by date)
   that yields the population total needs no LIMIT — it already collapses to one/few rows.
 - Use ONLY the exact table and column names provided.
@@ -220,12 +327,12 @@ DATABRICKS SQL DIALECT (avoid these mistakes — each one makes the WHOLE query 
   name (e.g. `SUM(total_net_sales) AS total_net_sales_all`). Re-using the same alias for a second
   aggregation over a column of that name causes a MISSING_ATTRIBUTES / ambiguous-attribute failure.
 
-""" + _ENGAGEMENT_FILTER_RULE + _TRANSACTION_TYPE_DISCIPLINE + _DATA_COMPLETENESS_DISCIPLINE + TRANSACTIONAL_DATA_DICTIONARY + UNIVERSAL + """
+""" + _ENGAGEMENT_FILTER_RULE + _SCOPE_PERIOD_RULE + _RECIPIENT_AGGREGATION_RULE + _TRANSACTION_TYPE_DISCIPLINE + _DATA_COMPLETENESS_DISCIPLINE + TRANSACTIONAL_DATA_DICTIONARY + UNIVERSAL + """
 OUTPUT — return ONLY this exact JSON object, no text outside it:
 
 {
   "queries": [
-    {"purpose": "<what this computes, short>", "sql": "SELECT ... LIMIT 25"}
+    {"purpose": "<what this computes — short; describe WHAT it measures, NOT how many rows: do NOT write a row count or LIMIT number (no 'Top 50'), and do NOT name a table or CTE alias>", "sql": "SELECT ... ORDER BY <material_col> DESC LIMIT 50"}
   ]
 }
 
@@ -238,6 +345,9 @@ FCPA SCOPE AREA: {scope_area}
 
 AUDIT POPULATION FILTER (MANDATORY — put this EXACT predicate FIRST in the WHERE clause of EVERY query
 and every CTE/subquery that reads a dashboard table): {engagement_filter}
+
+AUDIT SCOPE PERIOD (MANDATORY — bound EVERY query to this period, in ADDITION to the population filter,
+using each table's own transaction/posting/event date column): {scope_period_filter}
 
 SCOPE CATEGORY FILTER (MANDATORY when non-empty — these are the EXACT real CATEGORY values for this
 scope in the HCC activity table; include this predicate verbatim in the WHERE clause of every query
@@ -266,14 +376,21 @@ RULES:
 - Pick the single dashboard table that fits the scope, and filter it to the scope's activity using the
   REAL categorical values shown in the table info (never a guessed term). If no table fits, return an
   empty sql.
-- Put the AUDIT POPULATION FILTER predicate FIRST in the WHERE clause.
+- Put the AUDIT POPULATION FILTER predicate FIRST in the WHERE clause, and ALSO bound the query to the
+  AUDIT SCOPE PERIOD given in the user message (include only rows within that period, using this table's
+  own transaction/posting/event date column via try_cast(`col` AS DATE)); if no period is configured,
+  apply no date bound.
 - SELECT exactly three output columns, aliased exactly: `txn_date`, `txn_count`, `total_usd`.
     * txn_date  = the transaction/posting/event date column that best represents when spend occurred,
       cast to DATE (use try_cast/to_date; NULL is acceptable when no date fits).
     * txn_count = COUNT(*).
-    * total_usd = SUM of the USD spend. For the HCC user-input table use
-      COALESCE(NULLIF(try_cast(`DOCUMENT_CURRENCY_INVOICE_AMT_USD` AS DOUBLE),0), try_cast(`ACTIVITY_APPROVED_AMT_USD` AS DOUBLE));
-      for other tables use the table's own `*_USD` amount column wrapped in try_cast(... AS DOUBLE).
+    * total_usd = SUM of the USD spend. Choose the amount column BY TABLE (do NOT blindly use a
+      *_USD column — some tables have none, which would return 0):
+        - HCC activity table(s): COALESCE(NULLIF(try_cast(`DOCUMENT_CURRENCY_INVOICE_AMT_USD` AS DOUBLE),0), NULLIF(try_cast(`ACTIVITY_APPROVED_AMT_USD` AS DOUBLE),0), try_cast(`TOTAL_ACTIVITY_APPROVED_AMOUNT` AS DOUBLE)).
+        - Revenue / sales table (it has NO *_USD column): for a SALES scope use try_cast(`SALES_AMOUNT` AS DOUBLE) restricted to TRANSACTION_TYPE='Sale'; for a DISCOUNT / pricing / margin scope use try_cast(`ACTUAL_DISCOUNT_AMOUNT` AS DOUBLE) (the USD discount) instead.
+        - AP payment / disbursement table(s): try_cast(`DOCUMENT_CURRENCY_INVOICE_AMT_USD` AS DOUBLE).
+        - Travel & Expense (T&E) table: try_cast(`GC_INVC_LINE_AMT` AS DOUBLE) — this is the USD/group-currency amount. NEVER use `LC_INVC_LINE_AMT` (that is LOCAL currency).
+        - Any other table: the table's own `*_USD` amount column wrapped in try_cast(... AS DOUBLE).
 - GROUP BY the date expression. No LIMIT. Numeric/STRING safety: wrap numeric columns in try_cast.
 - Use ONLY columns present in the provided table info.
 
@@ -289,6 +406,9 @@ FCPA SCOPE AREA: {scope_area}
 
 AUDIT POPULATION FILTER (MANDATORY — put this EXACT predicate FIRST in the WHERE clause):
 {engagement_filter}
+
+AUDIT SCOPE PERIOD (MANDATORY — bound the query to this period using the table's own
+transaction/posting/event date column): {scope_period_filter}
 
 SCOPE CATEGORY FILTER (MANDATORY when non-empty — exact real CATEGORY values for this scope; include
 verbatim in the WHERE clause, do NOT guess your own): {category_filter}
@@ -310,12 +430,24 @@ runs, using ONLY the columns that actually exist in the provided table schema.
 
 RULES:
 - Use ONLY column names present in the AVAILABLE TABLES AND COLUMNS block. If the failed query
-  referenced a column that does not exist (an UNRESOLVED_COLUMN error), REMOVE that column/metric or
-  replace it with the correct existing column — never invent or guess a column name.
+  referenced a column that does not exist (an UNRESOLVED_COLUMN error), the DEFAULT fix is to REMOVE
+  the metric / predicate / SELECT item that uses it entirely. Only substitute a different column when
+  the schema contains one that is CLEARLY the same concept (e.g. a near-identical name). If there is no
+  clearly-equivalent real column, DROP that part of the query rather than forcing a substitute — a
+  smaller correct query is far better than one that fails again or changes meaning. NEVER invent, guess,
+  or re-use the same non-existent column name.
+- Do NOT drop the broad population aggregate (COUNT(*) + USD SUM) while fixing a column error — if only
+  an annotation/flag column is unresolvable, remove just that column and keep the aggregate so the
+  query still returns the population.
 - Fix alias problems: an alias defined in one CTE cannot be referenced in a sibling CTE that selects
   from the base table; a re-aggregated column must get a NEW distinct alias.
+- Fix GROUP BY / aggregation errors (MISSING_AGGREGATION): EVERY SELECT expression that is not inside an
+  aggregate function MUST appear in the GROUP BY. For a value brought in by a LEFT JOIN to a per-group
+  subquery (already one row per group key), either add that exact expression to the GROUP BY or wrap it
+  in MAX(...) / any_value(...) — NEVER select it raw alongside a GROUP BY. Do the same for columns like
+  COALESCE(db.col, 0) that come from the joined aggregate side.
 - Keep the query's original PURPOSE and its numeric-safety (wrap numeric STRING columns in
-  try_cast(`col` AS DOUBLE)). End with LIMIT 25.
+  try_cast(`col` AS DOUBLE)). End with LIMIT 50 (ORDER BY the most material dimension DESC — highest risk first).
 - Preserve the transaction-type discipline (exclude free goods / samples / credit memos / returns
   from discount/override metrics) where the query intends those metrics.
 - Preserve the AUDIT POPULATION FILTER: keep the ENGAGEMENT_NUMBER IN (...) predicate on the base
@@ -409,7 +541,7 @@ RISK SCORING — LIKELIHOOD x IMPACT MATRIX (the SAME matrix as the Risk Classif
   unfed/dead-join column, or an unvalidated anomaly/reconciliation gap is "Further Review Required"
   (→ Not Applicable) — it does NOT get a band merely because a concern exists.
 
-""" + _ENGAGEMENT_FILTER_RULE + _TRANSACTION_TYPE_DISCIPLINE + _DATA_COMPLETENESS_DISCIPLINE + TRANSACTIONAL_DATA_DICTIONARY + UNIVERSAL + """
+""" + _ENGAGEMENT_FILTER_RULE + _SCOPE_PERIOD_RULE + _RECIPIENT_AGGREGATION_RULE + _TRANSACTION_TYPE_DISCIPLINE + _DATA_COMPLETENESS_DISCIPLINE + TRANSACTIONAL_DATA_DICTIONARY + UNIVERSAL + """
 OUTPUT — return ONLY this exact JSON object (a SINGLE object, no "risks" array), no text outside it:
 
 {
@@ -628,6 +760,10 @@ FCPA SCOPE AREA: {scope_area}
 
 AUDIT POPULATION FILTER (MANDATORY — the sample_query and every calculation are valid ONLY when scoped
 with this EXACT predicate first in the WHERE clause): {engagement_filter}
+
+AUDIT SCOPE PERIOD (MANDATORY — every calculation and the sample_query must be bounded to this period,
+in ADDITION to the population filter, using each table's own transaction/posting/event date column):
+{scope_period_filter}
 
 === CPR AUDIT GUIDANCE ===
 

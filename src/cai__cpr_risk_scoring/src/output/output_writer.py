@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.config.constants import (
+    DASHBOARD_WORKFLOW_NAMES,
     MANUAL_REVIEW_LABEL,
     RISK_CATEGORY_NONE,
     RISK_CATEGORY_NOT_CATEGORIZED,
@@ -89,8 +90,20 @@ def _correct_source_family(entry: str) -> str:
         if key.lower() in fname:
             return _SOURCE_PREFIX_RE.sub(f"Source: {family}", entry, count=1)
     if _DASHBOARD_TABLE_RE.search(fname):
-        return _SOURCE_PREFIX_RE.sub("Source: Transactional Dashboard", entry, count=1)
+        # Relabel the family AND replace the raw table FQN with the dedicated dashboard name
+        # (e.g. cpr__gld.gld__user_input__travel_and_expense_dashboard__cpr -> "T&E Dashboard").
+        entry = _SOURCE_PREFIX_RE.sub("Source: Transactional Dashboard", entry, count=1)
+        return _FILE_NAME_RE.sub(f"File Name: {_dashboard_display_name(match.group(1))}", entry, count=1)
     return entry
+
+
+def _dashboard_display_name(file_name: str) -> str:
+    """Map a dashboard table reference (bare or schema-qualified) to its dedicated workflow name,
+    e.g. 'cpr__gld.gld__user_input__travel_and_expense_dashboard__cpr' -> 'T&E Dashboard'. Unknown
+    tables keep their base name."""
+    base = file_name.strip().strip("`").split(".")[-1].strip().strip("`").lower()
+    disp = DASHBOARD_WORKFLOW_NAMES.get(base, base)
+    return disp if disp.lower().endswith("dashboard") else f"{disp} Dashboard"
 
 
 def _norm_fname(name: str) -> str:
@@ -435,6 +448,13 @@ class OutputWriter:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("OutputWriter: Output F Delta export failed | %s", exc)
 
+    def write_other_hcc_types(self, rows: list, output_path) -> None:
+        """Write Output G — unmapped HCC activity types (rows already formatted)."""
+        if not rows:
+            logger.info("OutputWriter: no unmapped HCC activity types — skipping Output G sheet")
+            return
+        self._repo.write_other_hcc_types(rows, output_path)
+
     def _state_to_row(self, state: AuditState, sno: int) -> OutputRow:
         """Parse the LLM risk-writer output from AuditState and map it to an OutputRow."""
         finding  = state.risk_finding
@@ -455,6 +475,57 @@ class OutputWriter:
         scope_area_reasoning = parsed.get("scope_area_reasoning", "").strip()
         source              = _normalize_source_details(
             parsed.get("document_utilized", "").strip(), self._valid_supporting_files)
+        # Deterministic safety net: a reportable finding must cite EVERY supporting-evidence file it
+        # relied on. Add any surfaced evidence file that the writer NAMED in the Risk Description/
+        # Rationale prose but omitted from Source Details (so the primary evidence — e.g. the red-flag
+        # records — isn't dropped just because the writer listed one other evidence file). If the writer
+        # cited NO supporting evidence at all, fall back to appending every surfaced file. Re-normalised
+        # so the phantom filter + dedup still apply (only files in this auditor's index survive). Never
+        # fires for No Risk.
+        if risk_title != "No Risk Identified":
+            surfaced = getattr(finding, "supporting_doc_names", None) or []
+            existing = (source or "").lower()
+            prose = f"{description}\n{rationale}".lower()
+
+            def _named_in_prose(n: str) -> bool:
+                nl = n.lower()
+                stem = nl.rsplit(".", 1)[0]
+                return nl in prose or (len(stem) >= 8 and stem in prose)
+
+            missing = [n for n in surfaced if n and n.lower() not in existing and _named_in_prose(n)]
+            if not missing and "source: supporting evidence" not in existing:
+                missing = [n for n in surfaced if n]   # writer cited none → append all surfaced
+            # Deterministically-pulled topic evidence (e.g. the red-flag records for a red-flag question)
+            # is the finding's evidence by construction — ALWAYS cite it, even when the writer only
+            # described it ("the red-flag export") without the literal filename.
+            must_cite = getattr(finding, "must_cite_doc_names", None) or []
+            for n in must_cite:
+                if n and n.lower() not in existing and n not in missing:
+                    missing.append(n)
+            # Diagnostic: shows exactly what the safety net saw and did, so a dropped evidence file
+            # can be traced (surfaced vs must-cite vs what survived the phantom filter).
+            logger.info(
+                "[OutputWriter] source safety-net | surfaced=%d | must_cite=%s | missing=%s | valid_files=%d",
+                len(surfaced), must_cite, missing, len(self._valid_supporting_files),
+            )
+            if missing:
+                extra = "\n".join(f"• Source: Supporting Evidence; File Name: {n}" for n in missing)
+                base = source if (source and source != "Not Available") else ""
+                before = source
+                # Files actually RETRIEVED this run are in the index by construction — never phantoms.
+                # list_document_names() can return a partial set (enumeration cap), so union them in.
+                valid = set(self._valid_supporting_files)
+                if valid:
+                    valid |= {_norm_fname(n) for n in surfaced if n}
+                    valid |= {_norm_fname(n) for n in must_cite if n}
+                source = _normalize_source_details(f"{base}\n{extra}".strip(), valid)
+                dropped = [n for n in missing if n.lower() not in (source or "").lower()]
+                if dropped:
+                    logger.warning(
+                        "[OutputWriter] evidence file(s) DROPPED by phantom filter (not in valid set): %s | "
+                        "valid sample=%s", dropped, sorted(self._valid_supporting_files)[:15],
+                    )
+                del before
 
         # Category is driven by the Risk Type (in risk_title) so the reviewer rule holds even if the
         # model emits an inconsistent band: only Potential Risk is scored (High/Medium/Low); Further
@@ -504,6 +575,7 @@ class OutputWriter:
             scope_area=scope_area,
             scope_area_reasoning=scope_area_reasoning,
             calculation_evidence=(finding.calculation_evidence or None),
+            sql_queries=(getattr(finding, "sql_queries", None) or None),
             evidence_explanation=evidence_note,
             question=question.question_text,
             response=question.response_text,

@@ -164,7 +164,7 @@ class VectorIndexManager:
         )
         self._embeddings: Embeddings = embedding_provider.get_client()
         _prefix = f"{settings.databricks_catalog}.{settings.databricks_schema_name}"
-        self._index_names = {
+        _base_names = {
             "hcbi":         f"{_prefix}.{settings.hcbi_index_name}",
             "policy":       f"{_prefix}.{settings.policy_index_name}",
             "supporting":   f"{_prefix}.{settings.supporting_docs_index_name}",
@@ -178,6 +178,10 @@ class VectorIndexManager:
             "raw_transactional":      f"{_prefix}.{settings.raw_transactional_tables_index_name}",
             "questionnaire":          f"{_prefix}.{settings.questionnaire_index_name}",
         }
+        # Optional per-run suffix to isolate indexes on a fresh endpoint WITHOUT renaming source
+        # tables/volumes. Empty by default; set via INDEX_NAME_SUFFIX for an isolated run.
+        _sfx = getattr(settings, "index_name_suffix", "") or ""
+        self._index_names = {k: f"{v}{_sfx}" for k, v in _base_names.items()}
         self._index_cache: dict[str, Any] = {}
 
     def ensure_index(self, index_key: str) -> None:

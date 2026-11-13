@@ -43,9 +43,14 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
                            "idr question", "planning question", "audit question", "q"),
     "response":           ("company response", "management response", "response",
                            "response text", "answer", "resp"),
-    "followup_questions": ("followup question", "follow up question", "followup q", "fup question"),
+    "followup_questions": ("followup question", "follow up question", "followup q", "fup question",
+                           # CPR/audit-team review commentary acts as the auditor-side follow-up probe.
+                           "cpr team review comments", "cpr team review comment",
+                           "cpr review comments", "review comments"),
     "followup_responses": ("followup response", "follow up response", "followup a",
-                           "fup response", "followup answer"),
+                           "fup response", "followup answer",
+                           # "Comments/Notes" -> normalises to "comments notes".
+                           "comments notes", "comment notes", "comments note", "comments and notes"),
 }
 
 
@@ -212,17 +217,24 @@ class DatabricksQuestionnaireRepository:
         col_id = buckets["id"][0] if buckets["id"] else None
         method = "header"
 
-        # LLM pass only when the primary question/response is missing or ambiguous.
-        if self._llm is not None and (q is None or r is None):
+        # LLM pass runs when the primary question/response is missing/ambiguous, OR as a catch-all when
+        # NO follow-up column was found deterministically (handles newly-renamed follow-up/comment
+        # columns not yet in _COLUMN_ALIASES). Primary q/r/id are only FILLED if missing (deterministic
+        # wins); follow-ups are MERGED (appended, deduped) so the LLM only ever ADDS, never replaces.
+        if self._llm is not None and (q is None or r is None or (not fup_q and not fup_r)):
             try:
                 m = self._map_columns_llm(cols, sample_rows)
                 if m:
                     method = "header+llm"
                     q = q or m["question"]
                     r = r or m["response"]
-                    fup_q = fup_q or m["followup_questions"]
-                    fup_r = fup_r or m["followup_responses"]
                     col_id = col_id or m["id"]
+                    for c in m["followup_questions"]:
+                        if c not in fup_q:
+                            fup_q.append(c)
+                    for c in m["followup_responses"]:
+                        if c not in fup_r:
+                            fup_r.append(c)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[QuestionnaireRepo] LLM column mapping failed — using defaults | %s", exc)
 

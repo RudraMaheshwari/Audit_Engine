@@ -38,9 +38,21 @@ class RunRecord:
     # Monotonically increasing version so SSE streams only push on change.
     version: int = 0
 
+    def _current_status(self) -> str:
+        """Live, human-readable status for the response body. While running it is the current phase's
+        label (falling back to the phase code); otherwise a clear terminal/queued word."""
+        if self.state == RunState.RUNNING:
+            return self.label or self.status_code or "Running"
+        return {
+            RunState.PENDING: "Queued",
+            RunState.SUCCEEDED: "Completed",
+            RunState.FAILED: "Failed",
+        }.get(self.state, self.state.value)
+
     def to_status(self) -> RunStatus:
         return RunStatus(
             run_id=self.run_id, api=self.api, auditor_id=self.auditor_id, state=self.state,
+            current_status=self._current_status(),
             status_code=self.status_code, label=self.label, progress=self.progress,
             result=self.result, error=self.error, started_at=self.started_at, updated_at=self.updated_at,
         )

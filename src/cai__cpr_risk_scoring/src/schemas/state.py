@@ -142,6 +142,9 @@ class RiskOutput(BaseModel):
     evidence_explanation:    str
     calculation_evidence:    Optional[str] = None
     sql_queries:             Optional[str] = None
+    # Supporting-doc file names the SupportingDocsAgent actually surfaced for this question — used as a
+    # deterministic safety net so a reportable finding cites its evidence file even if the writer omitted it.
+    supporting_doc_names:    list[str] = Field(default_factory=list)
     samples:                 str = ""
 
     question:                Optional[str] = None

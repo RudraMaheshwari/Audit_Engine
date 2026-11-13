@@ -1,9 +1,9 @@
 """Load per-scope transaction totals from Output F (Scope Txn Summary) for slides 9/10.
 
 Output F lives alongside Output E — a sheet in the same audit workbook (excel source) or a sibling Delta
-table (db_table source). We read the per-scope Total Transactions and the full Total Amount cell (both
-local currency and USD, verbatim), keyed by a normalised scope name so the deck's scope areas resolve
-regardless of exact spelling. Best-effort: returns {} on any failure.
+table (db_table source). We read the per-scope Total Transactions and the full Total Amount (USD) cell
+verbatim, keyed by a normalised scope name so the deck's scope areas resolve regardless of exact
+spelling. Best-effort: returns {} on any failure.
 """
 
 from __future__ import annotations
@@ -24,10 +24,12 @@ _MISSING = "-"
 _SOURCE_EXCEL = "excel"
 
 # Normalised header -> internal field (resolves both Excel display headers and snake_case DB columns).
+# Output F amounts are USD-only now (local-currency/FX was removed), so the Total Amount header is
+# "Total Amount (USD)" -> "totalamountusd".
 _FIELD_BY_KEY = {
     "scopearea": "scope_area",
     "totaltransactions": "total_txns",
-    "totalamountlocalusd": "total_amount",
+    "totalamountusd": "total_amount",
 }
 
 
@@ -36,7 +38,7 @@ def _normalize(value: str) -> str:
 
 
 def _amount_text(amount_cell) -> str:
-    """Return the Total Amount cell verbatim (both local currency and USD); '-' when blank."""
+    """Return the Total Amount (USD) cell verbatim; '-' when blank."""
     s = str(amount_cell or "").strip()
     return s if s else _MISSING
 

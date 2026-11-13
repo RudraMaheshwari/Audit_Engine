@@ -43,126 +43,186 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Column indices in CPR Excel (1-based)
-_CPR_COL_SCOPE_DESC    = 3   # C
-_CPR_COL_RED_FLAGS     = 4   # D
-_CPR_COL_DATA_CALCS    = 9   # I
-_CPR_COL_SAMPLING_RAT  = 10  # J
-_CPR_COL_SAMPLE_SIZE   = 11  # K
-_CPR_HEADER_ROWS       = 3   # first 3 rows are headers; data starts row 4
+_CPR_COL_SCOPE_DESC    = 3
+_CPR_COL_RED_FLAGS     = 4
+_CPR_COL_DATA_CALCS    = 9
+_CPR_COL_SAMPLING_RAT  = 10
+_CPR_COL_SAMPLE_SIZE   = 11
+_CPR_HEADER_ROWS       = 3
 
 _SAMPLE_SEPARATOR = "─" * 60
-# Divider placed between successive calculation blocks in Calculation Evidence.
 _CALC_BLOCK_SEPARATOR = "\n" + "─" * 60 + "\n"
 
-# Sample sizing: pull exactly the Expected Sample Size from CPR col K rows per identified risk.
-_DEFAULT_SAMPLE_SIZE = 7   # fallback when col K has no usable number (e.g. "10%", "All", blank)
+_DEFAULT_SAMPLE_SIZE = 7
 
-# How many scope areas to analyse concurrently in run_all() (each scope = 1 LLM call + SQL).
 _SCOPE_ANALYSIS_WORKERS = 6
 
-# Column-name hints for categorical columns whose REAL distinct values are surfaced to the calc-SQL
-# builder, so a scope's activity filter matches actual values (e.g. CATEGORY='Fee for Service') rather
-# than a guessed term. Keeps FFS/Congress-style scopes from silently matching nothing.
 _CATEGORICAL_NAME_HINTS = ("category", "type", "classification", "status", "government_vendors")
 _MAX_CATEGORICAL_COLS = 6
 _MAX_CATEGORICAL_VALUES = 40
 
-# Columns that are identifiers / codes / period keys — NEVER meaningful to SUM in the evidence summary
-# (summing SUPPLIER_ID or COMPANY_CODE is noise). Matched on word boundaries so 'paid'/'invoice' are safe.
+_UPPER_IDENT_RE = re.compile(r"[A-Z][A-Z0-9_]{2,}")
+_SQL_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+_APOSTROPHE_VARIANTS_RE = re.compile("[’‘ʼʻ`´＇]")
+_FROM_JOIN_RE = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_.`]+)", re.IGNORECASE)
+_AS_ALIAS_RE = re.compile(r"\bAS\s+`?([A-Za-z0-9_]+)`?", re.IGNORECASE)
+_CTE_NAME_RE = re.compile(r"(?:\bWITH\b|,)\s*([A-Za-z0-9_]+)\s+AS\s*\(", re.IGNORECASE)
+_SQL_RESERVED_TOKENS = frozenset({
+    "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "BY", "HAVING", "LIMIT", "OFFSET", "DISTINCT",
+    "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "ILIKE", "RLIKE", "BETWEEN", "EXISTS",
+    "CASE", "WHEN", "THEN", "ELSE", "END", "ON", "USING", "JOIN", "INNER", "LEFT", "RIGHT", "FULL",
+    "OUTER", "CROSS", "WITH", "UNION", "ALL", "INTERSECT", "EXCEPT", "ASC", "DESC", "OVER",
+    "PARTITION", "ROWS", "RANGE", "UNBOUNDED", "PRECEDING", "FOLLOWING", "CURRENT", "ROW", "NULLS",
+    "FIRST", "LAST", "QUALIFY",
+    "SUM", "COUNT", "AVG", "MIN", "MAX", "COALESCE", "NULLIF", "CAST", "TRY_CAST", "UPPER", "LOWER",
+    "TRIM", "LTRIM", "RTRIM", "LENGTH", "SUBSTR", "SUBSTRING", "CONCAT", "CONCAT_WS", "REPLACE",
+    "ROUND", "ABS", "FLOOR", "CEIL", "CEILING", "DATEDIFF", "DATE_ADD", "DATE_SUB", "TO_DATE",
+    "DATE_FORMAT", "YEAR", "MONTH", "DAY", "QUARTER", "WEEK", "HOUR", "MINUTE", "SECOND", "NOW",
+    "CURRENT_DATE", "CURRENT_TIMESTAMP", "EXTRACT", "ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD",
+    "GREATEST", "LEAST", "IF", "IFNULL", "DECODE", "COLLECT_LIST", "COLLECT_SET", "ARRAY", "MAP",
+    "STRUCT", "EXPLODE", "SPLIT", "REGEXP_REPLACE", "REGEXP_EXTRACT", "INSTR", "LOCATE", "POSITION",
+    "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "DOUBLE", "FLOAT", "DECIMAL", "NUMERIC",
+    "STRING", "VARCHAR", "CHAR", "TEXT", "BOOLEAN", "DATE", "TIMESTAMP", "TIMESTAMP_NTZ", "BINARY",
+    "TRUE", "FALSE", "KG",
+})
+
 _NON_MEASURE_COL_RE = re.compile(
     r"(^|_)(id|code|number|no|key|guid|uuid|zip|year|month|quarter|date)(_|$)", re.IGNORECASE
 )
 
-# Deterministic scope → column filter resolver map.
-# Each scope maps to an ordered list of (table_key, column_name, keyword_hints).
-# At runtime, each entry is tried in order: distinct values of `column_name` in `table_key` are fetched,
-# then matched (case-insensitive substring) against `keyword_hints`. The FIRST entry that produces
-# ≥1 match wins and is injected as a mandatory `column IN (...)` predicate. Keywords are exact
-# lowercase fragments of the REAL values observed in the live data — no guessing.
-_SCOPE_CATEGORY_RESOLVER_MAP: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {
+_HCC_SCOPE_CATEGORY_VALUES: dict[str, list[str]] = {
+    "FEE_FOR_SERVICE__DOCTOR_CONSULTING": ["Lecture Fee", "Consulting Fee"],
+    "SPONSORSHIPS":                       ["Booth&Advertisement", "Sponsorship for the 3rd Party Congress"],
+    "CONGRESSES__JJ_ORGANIZED_EVENTS":    ["Sponsorship for HCP's attendance to the 3rd Party Congress"],
+    "EDUCATIONAL_GRANTS":                 ["Educational Grants / Campaign Donation"],
+    "DONATIONS":                          ["Contribution incl. Charitable Contribution"],
+    "MARKETING_RESEARCH_PROJECTS":        ["Market Research"],
+}
+_HCC_CATEGORY_TABLE_KEYS = ("hcc_full", "hcc")
+_HCC_CATEGORY_COLUMNS = ("CATEGORY", "REQUEST_TYPE")
+
+_SCOPE_CATEGORY_RESOLVER_MAP: dict[str, list[tuple[str, tuple[str, ...]]]] = {
     "CONGRESSES__JJ_ORGANIZED_EVENTS": [
-        ("hcc", "AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("congresses",)),
-        ("hcc", "CATEGORY",                               ("event invitee",)),
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("congresses",)),
+        ("CATEGORY",                               ("event invitee",)),
+        ("REQUEST_TYPE",                           ("congress", "organized event", "event invitee", "event")),
     ],
     "FEE_FOR_SERVICE__DOCTOR_CONSULTING": [
-        ("hcc", "AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("fee for service",)),
-        ("hcc", "CATEGORY",                               ("fee for service",)),
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("fee for service",)),
+        ("CATEGORY",                               ("fee for service",)),
+        ("REQUEST_TYPE",                           ("fee for service", "consulting")),
     ],
     "EDUCATIONAL_GRANTS": [
-        ("hcc", "AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("educational grant", "research grant")),
-        ("hcc", "CATEGORY",                               ("grant",)),
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("educational grant", "research grant")),
+        ("CATEGORY",                               ("grant",)),
+        ("REQUEST_TYPE",                           ("educational grant", "research grant", "grant")),
     ],
     "SPONSORSHIPS": [
-        ("hcc", "AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("promotional sponsorship",)),
-        ("hcc", "CATEGORY",                               ("event invitee",)),
-    ],
-    "VALUE_ADD__PATIENT_SUPPORT_PROG": [
-        ("hcc", "AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("patient support", "psp")),
-        ("hcc", "CATEGORY",                               ("patient support", "psp", "value add")),
-    ],
-    "PRODUCT_TRAINING": [
-        ("hcc", "AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("product training", "training")),
-        ("hcc", "CATEGORY",                               ("product training", "training")),
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("promotional sponsorship",)),
+        ("CATEGORY",                               ("event invitee",)),
+        ("REQUEST_TYPE",                           ("promotional sponsorship", "sponsorship")),
     ],
     "DONATIONS": [
-        ("hcc", "AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("donation",)),
-        ("hcc", "CATEGORY",                               ("donation",)),
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("donation", "contribution", "charitable")),
+        ("CATEGORY",                               ("donation", "contribution", "charitable")),
+        ("REQUEST_TYPE",                           ("donation", "contribution", "charitable")),
     ],
-    # Pricing / Revenue dashboard scopes — these have transactional data even when HCC is empty, so
-    # they must resolve to the pricing/revenue tables (not HCC). Tried in order; first match wins.
+    "MARKETING_RESEARCH_PROJECTS": [
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("market research",)),
+        ("CATEGORY",                               ("market research",)),
+        ("REQUEST_TYPE",                           ("market research",)),
+    ],
+    "VALUE_ADD__PATIENT_SUPPORT_PROG": [
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("patient support", "psp")),
+        ("CATEGORY",                               ("patient support", "psp", "value add")),
+        ("REQUEST_TYPE",                           ("patient support", "psp", "value add")),
+    ],
+    "PRODUCT_TRAINING": [
+        ("AUDIT_AREAS_CATEGORIZED_BY_GL_ACCOUNTS", ("product training", "training")),
+        ("CATEGORY",                               ("product training", "training")),
+        ("REQUEST_TYPE",                           ("product training", "training")),
+    ],
     "PRICING__DISCOUNTS__MARGINS__DISTRIBUTORS": [
-        ("revenue", "TRANSACTION_TYPE", ("sale",)),
-        ("pricing", "TRANSACTION_TYPE", ("sale",)),
+        ("TRANSACTION_TYPE", ("sale",)),
     ],
     "PRICE_OVERRIDES": [
-        ("pricing", "TRUE_PRICE_OVERRIDE", ("y",)),
-        ("revenue", "TRUE_PRICE_OVERRIDE", ("y",)),
+        ("TRUE_PRICE_OVERRIDE", ("y",)),
     ],
     "REBATES_PAID_TO_DISTRIBUTORS": [
-        ("revenue", "ORDER_REASON_DESCRIPTION", ("rebate",)),
-        ("pricing", "ORDER_REASON_DESCRIPTION", ("rebate",)),
+        ("ORDER_REASON_DESCRIPTION", ("rebate",)),
     ],
     "FREE_GOODS": [
-        ("otc", "TRANSACTION_TYPE",      ("free good",)),
+        ("TRANSACTION_TYPE", ("free good",)),
     ],
     "PRODUCT_SAMPLES": [
-        ("otc", "SALE_TYPE_DESCRIPTION", ("sample",)),
+        ("SALE_TYPE_DESCRIPTION", ("sample",)),
     ],
     "CREDIT_NOTES": [
-        ("otc", "TRANSACTION_TYPE",      ("credit memo",)),
+        ("TRANSACTION_TYPE", ("credit memo",)),
     ],
     "EXPENSE_REPORTS": [
-        ("travel_expense", "RPT_ENT_EXP_TYPE_NM", ("hcp", "meal", "symposium", "sponsorship", "registration")),
+        ("RPT_ENT_EXP_TYPE_NM", ("hcp", "meal", "symposium", "sponsorship", "registration")),
     ],
 }
 
 
-# Legal-entity form tokens dropped (wherever they appear — prefix OR suffix) when normalising a
-# payee/TPI name for matching, so "ZEST HEALTHCARE COMMUNICATIONS PTY LTD" and "Zest Healthcare
-# Communications" match, and the Indonesian "PT KALBE FARMA" matches "KALBE FARMA TBK". Kept broad and
-# international (these lists are country-specific — here IDR/Indonesian) so no dataset silently misses.
+_SCOPE_FALLBACK_DASHBOARD: dict[str, tuple[str, ...]] = {
+    "CONTRACT_SALES_AGENTS":                        ("payment", "disbursement"),
+    "EDUCATIONAL_GRANTS":                           ("payment", "disbursement"),
+    "FEE_FOR_SERVICE__DOCTOR_CONSULTING":           ("payment", "disbursement"),
+    "PAYMENTS_IN_AP_TO_DISTRIBUTORS":               ("payment", "disbursement"),
+    "REBATES_PAID_TO_DISTRIBUTORS":                 ("payment", "disbursement"),
+    "SPONSORSHIPS":                                 ("payment", "disbursement"),
+    "VALUE_ADD__PATIENT_SUPPORT_PROG":              ("payment", "disbursement"),
+    "CONTRACT_MANUFACTURING_VENDORS":               ("payment", "disbursement"),
+    "FORMER_GOVERNMENT_EMPLOYEES":                  ("payment", "disbursement"),
+    "INTERACTION_WITH_PRODUCT_AND_SITE_REGULATORS": ("payment", "disbursement"),
+    "LEGAL_FEES":                                   ("payment", "disbursement"),
+    "LOBBYISTS":                                    ("payment", "disbursement"),
+    "LOCAL_TRAVEL_AGENCIES":                        ("payment", "disbursement"),
+    "LOGISTICS_INTERMEDIARIES__CUSTOMS":            ("payment", "disbursement"),
+    "MARKETING_RESEARCH_PROJECTS":                  ("payment", "disbursement"),
+    "MEDIA_AND_PUBLIC_RELATIONS_VENDORS":           ("payment", "disbursement"),
+    "PAYMENTS_TO_GOVERNMENT_AGENCIES":              ("payment", "disbursement"),
+    "PAYMENTS_TO_GOVERNMENT_OFFICIALS":             ("payment", "disbursement"),
+    "PROCUREMENT_FROM_GOVERNMENT_OWNED_ENTITIES":   ("payment", "disbursement"),
+    "PRODUCT_PROMOTION_VIA_THIRD_PARTY":            ("payment", "disbursement"),
+    "ROYALTIES_PAID_TO_PUBLIC_HCPS":                ("payment", "disbursement"),
+    "TRAINING_FOR_POLICYMAKERS":                    ("payment", "disbursement"),
+    "PATIENT_ADVOCACY":                             ("payment", "disbursement"),
+    "STRATEGIC_AFFAIRS":                            ("payment", "disbursement"),
+    "ONE_TIME_VENDOR":                              ("payment", "disbursement"),
+    "CLINICAL_TRIALS":                              ("payment", "disbursement"),
+    "CASH_ADVANCES__PETTY_CASH__MANUAL_CHECKS":     ("payment", "disbursement"),
+    "FREE_GOODS":                                   ("revenue",),
+    "PRODUCT_SAMPLES":                              ("revenue",),
+    "PRICING__DISCOUNTS__MARGINS__DISTRIBUTORS":    ("revenue",),
+    "PRICE_OVERRIDES":                              ("revenue",),
+    "CREDIT_NOTES":                                 ("revenue",),
+    "EXPENSE_REPORTS":                              ("travel_expense",),
+    "GOVERNMENT_AFFAIRS":                           ("travel_expense",),
+    "MARKET_ACCESS":                                ("travel_expense",),
+}
+
+
 _LEGAL_SUFFIX_TOKENS = {
-    # Anglo / common
     "PTY", "LTD", "LIMITED", "INC", "INCORPORATED", "LLC", "PLC", "CO", "CORP", "CORPORATION",
     "COMPANY", "COMPANIES", "LLP", "LP",
-    # European
     "GMBH", "MBH", "BV", "NV", "SA", "AG", "AB", "AS", "OY", "SRL", "SPA", "SAS", "SARL", "SASU",
     "SL", "KG", "OHG", "KFT", "ZRT", "EOOD", "OOD", "AD", "DOO", "DOOEL", "OOO", "SP", "ZOO",
     "APS", "APB", "KS", "SC", "SE",
-    # Asia-Pacific (Indonesia/Malaysia/Singapore/Japan/Korea/etc.)
     "PT", "TBK", "PERSERO", "PERSEROAN", "TERBATAS", "TERBUKA", "CV", "UD", "FA",
     "PTE", "SDN", "BHD", "BERHAD", "KK", "GK", "YK", "LLK",
-    # Middle East free-zone forms
     "FZE", "FZCO", "FZ", "DMCC",
 }
 
-# Connector / stop tokens dropped as non-distinctive noise ("Johnson AND Johnson", "Bank OF ...",
-# Indonesian "DAN"). Never carry entity identity, so they only dilute token-set matching.
 _CONNECTOR_TOKENS = {"AND", "THE", "OF", "DE", "DI", "DU", "DA", "DAN", "EN", "ET", "UND"}
 
-# Combined drop-set applied during normalisation.
 _DROP_TOKENS = _LEGAL_SUFFIX_TOKENS | _CONNECTOR_TOKENS
+
+
+_CJK_RANGES = "가-힣ᄀ-ᇿ㄰-㆏一-鿿぀-ヿ"
+_CJK_RE = re.compile(f"[{_CJK_RANGES}]")
 
 
 def _normalize_entity(name) -> str:
@@ -170,21 +230,19 @@ def _normalize_entity(name) -> str:
 
     Fold accents to ASCII (NESTLÉ -> NESTLE) so Latin variants align; drop punctuation and legal-form /
     connector tokens (wherever they sit). KEEPS region/qualifier tokens such as 'NZ' (from '(NZ)') so
-    genuinely different legal entities — e.g. IQVIA (NZ) vs IQVIA Australia — are NOT merged. Non-Latin
-    scripts (CJK/Hangul) fold away here and match via their romanised/English variant added upstream."""
+    genuinely different legal entities — e.g. IQVIA (NZ) vs IQVIA Australia — are NOT merged. Hangul/CJK
+    characters are PRESERVED so a Korean payee can match a Korean TPI name (the inventory loads both the
+    English and local-language names)."""
     import re as _re
     import unicodedata as _ud
     raw = str(name) if name is not None else ""
-    # NFKD-fold diacritics to bare ASCII letters so "É"/"Ü"/"Ñ" survive as "E"/"U"/"N" (not stripped).
     folded = "".join(c for c in _ud.normalize("NFKD", raw) if not _ud.combining(c))
     s = folded.upper()
-    s = _re.sub(r"[^A-Z0-9 ]+", " ", s)    # drop punctuation (parentheses -> spaces; inner tokens kept)
+    s = _re.sub(rf"[^A-Z0-9{_CJK_RANGES} ]+", " ", s)
     tokens = [t for t in s.split() if t and t not in _DROP_TOKENS]
     return " ".join(tokens)
 
 
-# Supporting-document source label per scope (col E on the summary sheet). Names the doc that scope's
-# data is expected from, even when the amount cannot yet be computed from it (shown as a reference).
 _SCOPE_DOC_SOURCES: dict[str, list[str]] = {
     "DUE_DILIGENCE":                   ["TPI Inventory List"],
     "TENDERS":                         ["IDR Tender Report (Tab 4, Q68)"],
@@ -192,12 +250,6 @@ _SCOPE_DOC_SOURCES: dict[str, list[str]] = {
     "PAYMENTS_IN_AP_TO_DISTRIBUTORS":  ["Distributor List (IDR)"],
 }
 
-# Name-list scopes: the transaction count/amount comes from filtering the dashboards to an ENTITY LIST.
-# scope_id -> (filename keywords to auto-discover the list in supporting docs, dashboard tables to
-# filter, col-E source label). DUE_DILIGENCE uses the already-loaded structured TPI inventory, so it
-# has no discovery keywords; the others auto-discover their list file from the auditor's supporting docs.
-# Both the Disbursement and Payment AP dashboards are included (per reviewer: "Payments & Disbursements
-# data"). They can report the same AP population, so Total Transactions sums across both by design.
 _NAME_LIST_SCOPES: dict[str, tuple[tuple[str, ...], tuple[str, ...], str]] = {
     "DUE_DILIGENCE":                   ((), ("disbursement", "payment", "revenue"), "TPI Inventory List"),
     "PAYMENTS_IN_AP_TO_DISTRIBUTORS":  (("distributor",), ("disbursement", "payment"), "Distributor List (IDR)"),
@@ -205,7 +257,11 @@ _NAME_LIST_SCOPES: dict[str, tuple[tuple[str, ...], tuple[str, ...], str]] = {
     "TENDERS":                         (("tender",), ("disbursement", "payment"), "IDR Tender Report (Tab 4, Q68)"),
 }
 
-# Payee/entity NAME-column hints per dashboard table (used to filter by an entity list).
+_TPI_PAYMENT_CALC_SCOPES: dict[str, str] = {
+    "DUE_DILIGENCE":                  "in-scope third parties (TPI Inventory List)",
+    "PAYMENTS_IN_AP_TO_DISTRIBUTORS": "in-scope distributors (Distributor List)",
+}
+
 _TABLE_NAME_HINTS: dict[str, tuple[str, ...]] = {
     "disbursement": ("supplier", "vendor"),
     "payment":      ("supplier", "vendor"),
@@ -226,17 +282,17 @@ class ScopeTxnSummary:
       - doc side    (doc_txn_count / doc_total_usd / doc_usd_by_date) → from supporting documents
     `table_sources` / `doc_sources` name where each side's figures came from (cols D / E)."""
     scope_id: str
-    # Transactional-table (dashboard) side
     txn_count: int = 0
     total_usd: float = 0.0
     usd_by_date: dict[str, float] = field(default_factory=dict)
     table_sources: list[str] = field(default_factory=list)
-    # Supporting-document side
     doc_txn_count: int = 0
     doc_total_usd: float = 0.0
     doc_usd_by_date: dict[str, float] = field(default_factory=dict)
     doc_sources: list[str] = field(default_factory=list)
     has_data: bool = False
+    amount_display_override: str | None = None
+    payee_breakdown: list = field(default_factory=list)
 
 
 def _read_col(ws, col_idx: int, start_row: int) -> str:
@@ -264,16 +320,17 @@ class TransactionalDataAnalysisAgent:
       4. When a risk is present, pulls exactly the Expected Sample Size of sample rows for handoff
     """
 
-    def __init__(self, llm: BaseChatModel, settings: Settings) -> None:
+    def __init__(
+        self, llm: BaseChatModel, settings: Settings, tpi_names: list[str] | None = None
+    ) -> None:
         self._llm = llm
         self._settings = settings
         self._engine = self._build_engine(settings)
         self._distinct_values_cache: dict[tuple[str, str], list[str]] = {}
-        # TPI inventory (per-auditor sheet) for supplier/payee → in-scope-TPI matching.
-        tpi_names = load_tpi_inventory_names(settings, llm=llm)
+        if tpi_names is None:
+            tpi_names = load_tpi_inventory_names(settings, llm=llm)
         self._tpi_names = [n for n in (tpi_names or []) if str(n).strip()]
         self._tpi_inventory_block = format_tpi_inventory_block(tpi_names, settings.tpi_inventory_sheet)
-        # HCC GL account map for verifying GL codes against the approved activity mapping.
         gl_mapping = load_gl_account_map(settings)
         self._gl_account_map_block = format_gl_account_map_block(gl_mapping)
         logger.info(
@@ -283,9 +340,6 @@ class TransactionalDataAnalysisAgent:
             len(tpi_names), settings.tpi_inventory_sheet, len(gl_mapping),
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Audit population (engagement number) helpers
-    # ──────────────────────────────────────────────────────────────────────────
 
     @cached_property
     def _engagement_filter(self) -> str:
@@ -299,6 +353,25 @@ class TransactionalDataAnalysisAgent:
         number(s), or '' if none configured."""
         clause = self._settings.engagement_filter_clause
         return f"WHERE {clause}" if clause else ""
+
+    @cached_property
+    def _scope_period_filter(self) -> str:
+        """Runtime instruction bounding every generated query to the audit scope period. The date
+        COLUMN differs per dashboard table, so this is phrased as a directive the model applies on each
+        table's own transaction/posting/event date column — not a single fixed SQL predicate. Returns a
+        'no period configured' note when neither bound is set (so no date filter is applied)."""
+        start = (self._settings.scope_period_start or "").strip()
+        end = (self._settings.scope_period_end or "").strip()
+        apply_hint = ("Apply on each table using THAT table's own transaction/posting/event date column "
+                      "wrapped in try_cast(`col` AS DATE); exclude any row dated outside this range.")
+        if start and end:
+            return (f"Include ONLY rows whose transaction/posting/event date is BETWEEN {start} AND {end} "
+                    f"(inclusive). {apply_hint}")
+        if start:
+            return f"Include ONLY rows whose transaction/posting/event date is ON OR AFTER {start}. {apply_hint}"
+        if end:
+            return f"Include ONLY rows whose transaction/posting/event date is ON OR BEFORE {end}. {apply_hint}"
+        return "(no explicit scope period configured — apply no date bound)"
 
     def _distinct_column_values(self, table_key: str, column: str) -> list[str]:
         """Return cached distinct non-null values of `column` from the table mapped to `table_key`."""
@@ -314,18 +387,34 @@ class TransactionalDataAnalysisAgent:
                 f"SELECT DISTINCT {column} AS v FROM {table} {self._engagement_where()}"
             )
             values = [str(r.get("v")).strip() for r in rows if r.get("v") not in (None, "")]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Could not read distinct %s.%s | %s",
-                AGENT_TRANSACTIONAL_ANALYSIS, table_key, column, exc,
-            )
+        except Exception as exc:
+            msg = str(exc)
+            if "UNRESOLVED_COLUMN" in msg or "cannot be resolved" in msg:
+                logger.debug("[%s] Column %s not on %s — skipping (table-agnostic scan)",
+                             AGENT_TRANSACTIONAL_ANALYSIS, column, table_key)
+            else:
+                logger.warning("[%s] Could not read distinct %s.%s | %s",
+                               AGENT_TRANSACTIONAL_ANALYSIS, table_key, column, msg.splitlines()[0][:200])
             values = []
         self._distinct_values_cache[cache_key] = values
         return values
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Tenders — IDR tender-list supporting document (best-effort, Tenders scope only)
-    # ──────────────────────────────────────────────────────────────────────────
+    def _distinct_values_all_tables(self, column: str, table_keys=None) -> list[str]:
+        """Distinct values of `column`, engagement-scoped, unioned + de-duplicated. By default scans
+        EVERY active dashboard table that carries the column (table-agnostic); pass `table_keys` to
+        restrict the scan to a specific subset (used for HCC-first resolution). Tables lacking the
+        column contribute nothing."""
+        keys = table_keys if table_keys is not None else list(self._settings.dashboard_tables)
+        seen: set[str] = set()
+        out: list[str] = []
+        for table_key in keys:
+            for v in self._distinct_column_values(table_key, column):
+                key = v.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append(v.strip())
+        return out
+
 
     @cached_property
     def _tender_list_block(self) -> str:
@@ -359,7 +448,7 @@ class TransactionalDataAnalysisAgent:
                 "and the payment date for possible bribery red flags. Do NOT invent entities not present here.\n"
                 f"{joined}"
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] Tender-list retrieval skipped | %s", AGENT_TRANSACTIONAL_ANALYSIS, exc)
             return ""
 
@@ -367,6 +456,62 @@ class TransactionalDataAnalysisAgent:
         """The tender-list block for the Tenders scope only; '' for every other scope."""
         resolved = _resolve_scope_id(scope_id.replace("_", " ")) or scope_id.strip().upper()
         return self._tender_list_block if resolved == "TENDERS" else ""
+
+    def _tpi_payment_calc_block(self, scope_id: str) -> tuple[str, str]:
+        """Deterministic 'payments made to the in-scope named parties' calculation for a name-list
+        payment scope (Due Diligence via the TPI inventory; AP-to-distributors via the distributor
+        list). Reuses the EXACT token matcher Output F uses (``_name_list_summary``), so this calc
+        figure and the Output F — Scope Transaction Summary figure are guaranteed identical (same
+        names, same cosmetic-tolerant matching, same AP superset rule). Returns
+        (block_text, representative_sql), or ("", "") for any other scope / when no names resolve.
+
+        This is why the two are no longer 'separate': the generic LLM calcs still show the AP
+        population (Janssen etc. — vendors that are NOT TPIs), while THIS block isolates only the
+        payments whose payee matches a party on the TPI Inventory List."""
+        resolved = _resolve_scope_id(scope_id.replace("_", " ")) or scope_id.strip().upper()
+        label = _TPI_PAYMENT_CALC_SCOPES.get(resolved)
+        if not label:
+            return "", ""
+        cfg = _NAME_LIST_SCOPES.get(resolved)
+        if not cfg:
+            return "", ""
+        keywords, table_keys, doc_label = cfg
+        names = [str(n).strip() for n in self._name_list_for_scope(resolved, keywords) if str(n).strip()]
+        if not names:
+            return "", ""
+        summary = self._name_list_summary(resolved, names, table_keys, doc_label)
+        sources = "; ".join(summary.table_sources) if summary.table_sources else "Not Available"
+        block = (
+            f"Calculation: Payments made to {label} — payees matched against the {doc_label} "
+            f"({len(names)} listed parties), token-matched on the SAME basis as Output F (Scope "
+            f"Transaction Summary) so the two figures are identical. The other calculations above cover "
+            f"the whole AP population (which includes ordinary vendors that are NOT in-scope parties); "
+            f"this one isolates only payments to the listed parties.\n"
+            f"Table: {sources}\n"
+            f"Summary (in-scope payees only): matched_payment_count={summary.txn_count}; "
+            f"total_usd_paid_to_in_scope_parties={summary.total_usd:,.2f}"
+        )
+        breakdown = summary.payee_breakdown or []
+        if breakdown:
+            shown = breakdown[:50]
+            lines = [
+                f"  {i}. matched_party: {name} | txn_count: {cnt} | total_usd: {usd:,.2f}"
+                for i, (name, cnt, usd) in enumerate(shown, start=1)
+            ]
+            more = (f"\n  … and {len(breakdown) - 50} more matched parties"
+                    if len(breakdown) > 50 else "")
+            block += ("\nMatched in-scope parties (top 50 by USD paid — these are the TPIs the payments "
+                      f"matched to):\n" + "\n".join(lines) + more)
+        sample = [" ".join(n.upper().split()).replace("'", "''") for n in names[:12]]
+        in_list = ", ".join(f"'{s}'" for s in sample)
+        tail = f"\n  /* …and {len(names) - 12} more listed parties */" if len(names) > 12 else ""
+        sql = (
+            "-- Representative only; authoritative figure uses cosmetic-tolerant token matching (= Output F).\n"
+            "SELECT COUNT(*) AS matched_payment_count, SUM(DOCUMENT_CURRENCY_INVOICE_AMT_USD) AS total_usd\n"
+            "FROM <AP payment / disbursement table>\n"
+            f"WHERE UPPER(TRIM(SUPPLIER_NAME)) IN ({in_list}{tail}\n);"
+        )
+        return block, sql
 
     @cached_property
     def _remediation_register_block(self) -> str:
@@ -405,30 +550,77 @@ class TransactionalDataAnalysisAgent:
                 "PRIOR-FINDING CLOSURE rule). Do NOT invent items not present here.\n"
                 f"{joined}"
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] MAP/GACS remediation retrieval skipped | %s",
                            AGENT_TRANSACTIONAL_ANALYSIS, exc)
             return ""
 
-    def _resolve_scope_category_filter(self, scope_id: str) -> str:
-        """Return a mandatory `column IN ('v1','v2',…)` predicate for a scope whose population is
-        distinguished by a categorical column. Tries each (table_key, column, keywords) entry in
-        _SCOPE_CATEGORY_RESOLVER_MAP in order; the first entry whose keywords match ≥1 real distinct
-        value wins. Returns '' when no entry matches (LLM falls back to table_info values)."""
+    def _table_for_category_columns(self, category_filter: str) -> str:
+        """The dashboard FQN that holds EVERY column used in `category_filter` — but ONLY when exactly
+        one dashboard qualifies (unambiguous). e.g. SALE_TYPE_DESCRIPTION -> the OTC dashboard. Returns
+        '' when no table or more than one has them (e.g. CATEGORY/REQUEST_TYPE live on both HCC tables),
+        so HCC scopes are left to their existing resolution and only single-home columns are steered."""
+        cols = {m.upper() for m in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s+IN\s*\(", category_filter or "")}
+        if not cols:
+            return ""
+        hosts: list[str] = []
+        for fqn in self._settings.dashboard_tables.values():
+            try:
+                have = {c.upper() for c, _ in self._get_table_schema(fqn)}
+            except Exception:  # noqa: BLE001
+                continue
+            if have and cols <= have:
+                hosts.append(fqn)
+        return hosts[0] if len(hosts) == 1 else ""
+
+    def _resolve_scope_category_filter(self, scope_id: str, prefer_hcc: bool = False) -> str:
+        """Return a mandatory category predicate scoping this scope's HCC/transactional population.
+
+        HCC scopes with an auditor-provided value list (_HCC_SCOPE_CATEGORY_VALUES) are matched by EXACT
+        value in CATEGORY and/or REQUEST_TYPE — only those real values are included, never a substring
+        (so 'Sponsorship for the 3rd Party Congress' is Sponsorship, not Congress). Returns e.g.
+        "(CATEGORY IN (...) OR REQUEST_TYPE IN (...))". All other scopes use the keyword resolver
+        (_SCOPE_CATEGORY_RESOLVER_MAP); first entry whose keyword matches ≥1 real value wins. '' if none.
+
+        `prefer_hcc` (Output F summary ONLY): these activity categories can appear in HCC AND in other
+        tables (payment/disbursement/etc.). For the Output F totals we give HCC PRIORITY — resolve from
+        the HCC tables first, and consult the other tables ONLY when HCC carries none of the scope's
+        values, so the same activity is not double-counted across tables. The calc leaves this off
+        (prefer_hcc=False): it resolves table-agnostically and runs its full calculations as before."""
+        all_keys = list(self._settings.dashboard_tables)
+        if prefer_hcc:
+            hcc_keys = [k for k in _HCC_CATEGORY_TABLE_KEYS if k in all_keys]
+            other_keys = [k for k in all_keys if k not in _HCC_CATEGORY_TABLE_KEYS]
+            table_tiers = [tier for tier in (hcc_keys, other_keys) if tier]
+        else:
+            table_tiers = [all_keys]
+
+        exact = _HCC_SCOPE_CATEGORY_VALUES.get(scope_id)
+        if exact is not None:
+            wanted = {v.strip().lower() for v in exact}
+            for tier in table_tiers:
+                parts: list[str] = []
+                for column in _HCC_CATEGORY_COLUMNS:
+                    real = self._distinct_values_all_tables(column, tier)
+                    matched = sorted({v for v in real if v.strip().lower() in wanted})
+                    if matched:
+                        quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in matched)
+                        parts.append(f"{column} IN ({quoted})")
+                if parts:
+                    return "(" + " OR ".join(parts) + ")" if len(parts) > 1 else parts[0]
+
         entries = _SCOPE_CATEGORY_RESOLVER_MAP.get(scope_id)
         if not entries:
             return ""
-        for table_key, column, keywords in entries:
-            real_values = self._distinct_column_values(table_key, column)
-            matched = sorted({v for v in real_values if any(k in v.lower() for k in keywords)})
-            if matched:
-                quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in matched)
-                return f"{column} IN ({quoted})"
+        for tier in table_tiers:
+            for column, keywords in entries:
+                real_values = self._distinct_values_all_tables(column, tier)
+                matched = sorted({v for v in real_values if any(k in v.lower() for k in keywords)})
+                if matched:
+                    quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in matched)
+                    return f"{column} IN ({quoted})"
         return ""
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ──────────────────────────────────────────────────────────────────────────
 
     def run_all(self) -> list[RiskOutput]:
         """Analyse EVERY scope area, each guided by its own CPR sheet, producing one row per scope.
@@ -453,15 +645,18 @@ class TransactionalDataAnalysisAgent:
             AGENT_TRANSACTIONAL_ANALYSIS, len(guidance_by_scope), list(guidance_by_scope),
         )
 
-        # Data summary is the same 3 tables for every scope — pull it once and reuse.
         data_summary, table_info = self._pull_data_summary()
 
-        # Pre-warm the MAP/GACS remediation register on the main thread: every scope worker reads this
-        # cached_property, and cached_property is not thread-safe on first access — compute it once here
-        # so the concurrent workers all share the single cached value (one retrieval, no race).
         _ = self._remediation_register_block
 
         scopes = list(guidance_by_scope.items())
+        workers = max(1, min(_SCOPE_ANALYSIS_WORKERS, len(scopes)))
+        logger.info(
+            "[%s] Analysing %d scope(s) with %d concurrent worker(s)",
+            AGENT_TRANSACTIONAL_ANALYSIS, len(scopes), workers,
+        )
+
+        results: list[RiskOutput] = []
 
         def _analyze_one(item: tuple[str, dict[str, str]]) -> list[RiskOutput]:
             scope_id, guidance = item
@@ -474,15 +669,7 @@ class TransactionalDataAnalysisAgent:
                 )
                 return []
 
-        workers = max(1, min(_SCOPE_ANALYSIS_WORKERS, len(scopes)))
-        logger.info(
-            "[%s] Analysing %d scope(s) with %d concurrent worker(s)",
-            AGENT_TRANSACTIONAL_ANALYSIS, len(scopes), workers,
-        )
-
-        results: list[RiskOutput] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            # pool.map preserves input order, so output scope order is deterministic.
             for rows in pool.map(_analyze_one, scopes):
                 results.extend(rows)
 
@@ -516,12 +703,10 @@ class TransactionalDataAnalysisAgent:
         for scope_id, guidance in guidance_by_scope.items():
             try:
                 summaries.append(self._scope_summary_for(scope_id, guidance, table_info))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("[%s] Scope summary failed | scope=%s | error=%s",
                                AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
                 summaries.append(ScopeTxnSummary(scope_id=scope_id))
-        # Attach the supporting-doc source label (col E) to each scope that has one, even when its
-        # amount cannot yet be computed from that doc — so the sheet always shows where the data lives.
         for summary in summaries:
             doc_srcs = _SCOPE_DOC_SOURCES.get(summary.scope_id)
             if doc_srcs and not summary.doc_sources:
@@ -529,6 +714,64 @@ class TransactionalDataAnalysisAgent:
         logger.info("[%s] Built transaction summary for %d scope(s)",
                     AGENT_TRANSACTIONAL_ANALYSIS, len(summaries))
         return summaries
+
+    def build_other_hcc_activities(self) -> list[tuple[str, int, float]]:
+        """Output G — HCC activity types (CATEGORY-else-REQUEST_TYPE) that are NOT mapped to any scope
+        area, each with its transaction count + total USD. Excludes the values already claimed by a scope
+        (_HCC_SCOPE_CATEGORY_VALUES) and the generic 'Event' / 'None' / blank. Engagement + scope-period
+        scoped. Returns [(activity_type, txn_count, total_usd), …] ordered by amount DESC."""
+        claimed = {v.strip().lower() for vals in _HCC_SCOPE_CATEGORY_VALUES.values() for v in vals}
+        excluded = claimed | {"event", "none", ""}
+
+        eff = ("CASE WHEN CATEGORY IS NULL OR trim(CATEGORY) = '' THEN REQUEST_TYPE "
+               "WHEN lower(trim(CATEGORY)) RLIKE '^(category|cat)[ -]*[0-9]+$' THEN REQUEST_TYPE "
+               "ELSE CATEGORY END")
+        usd = ("COALESCE(NULLIF(try_cast(DOCUMENT_CURRENCY_INVOICE_AMT_USD AS DOUBLE), 0), "
+               "NULLIF(try_cast(ACTIVITY_APPROVED_AMT_USD AS DOUBLE), 0), "
+               "try_cast(TOTAL_ACTIVITY_APPROVED_AMOUNT AS DOUBLE))")
+
+        clauses: list[str] = []
+        if self._settings.engagement_filter_clause:
+            clauses.append(self._settings.engagement_filter_clause)
+        start = (self._settings.scope_period_start or "").strip()
+        end = (self._settings.scope_period_end or "").strip()
+        dcol = "COALESCE(try_cast(EVENT_START_DATE AS DATE), try_cast(EVENT_END_DATE AS DATE))"
+        if start and end:
+            clauses.append(f"{dcol} BETWEEN DATE '{start}' AND DATE '{end}'")
+        elif start:
+            clauses.append(f"{dcol} >= DATE '{start}'")
+        elif end:
+            clauses.append(f"{dcol} <= DATE '{end}'")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        for table_key in _HCC_CATEGORY_TABLE_KEYS:
+            table = self._settings.dashboard_tables.get(table_key)
+            if not table:
+                continue
+            try:
+                rows = self._run_sql(
+                    f"SELECT {eff} AS activity_type, COUNT(*) AS txn_count, "
+                    f"ROUND(SUM({usd}), 2) AS total_usd FROM {table} {where} "
+                    f"GROUP BY {eff} ORDER BY total_usd DESC NULLS LAST"
+                )
+            except Exception as exc:
+                logger.warning("[%s] Output G aggregate failed on %s | %s",
+                               AGENT_TRANSACTIONAL_ANALYSIS, table_key, exc)
+                continue
+            out: list[tuple[str, int, float]] = []
+            for r in rows:
+                name = str(r.get("activity_type") or "").strip()
+                if not name or name.lower() in excluded:
+                    continue
+                cnt = int(self._coerce_number(r.get("txn_count")) or 0)
+                amt = float(self._coerce_number(r.get("total_usd")) or 0.0)
+                out.append((name, cnt, amt))
+            if out:
+                logger.info("[%s] Output G — %d other HCC activity type(s) from %s",
+                            AGENT_TRANSACTIONAL_ANALYSIS, len(out), table_key)
+                return out
+        logger.info("[%s] Output G — no unmapped HCC activity types found", AGENT_TRANSACTIONAL_ANALYSIS)
+        return []
 
     def _name_list_summary(
         self, scope_id: str, names: list[str], table_keys: tuple[str, ...], doc_label: str
@@ -544,20 +787,55 @@ class TransactionalDataAnalysisAgent:
         total_count = 0
         usd_by_date: dict[str, float] = {}
         sources: list[str] = []
-        for table_key in table_keys:
+
+        _AP_KEYS = ("payment", "disbursement")
+        ap_keys = [k for k in table_keys if k in _AP_KEYS]
+        other_keys = [k for k in table_keys if k not in _AP_KEYS]
+
+        def _summ(table_key: str):
             hints = _TABLE_NAME_HINTS.get(table_key, ("supplier", "vendor", "customer", "name"))
             try:
-                count, by_date, display = self._name_filtered_table_summary(table_key, hints, names)
-            except Exception as exc:  # noqa: BLE001
+                return self._name_filtered_table_summary(table_key, hints, names)
+            except Exception as exc:
                 logger.warning("[%s] %s name-list table summary failed | table=%s | %s",
                                AGENT_TRANSACTIONAL_ANALYSIS, scope_id, table_key, exc)
-                continue
+                return 0, {}, None, {}
+
+        payees: dict[str, list] = {}
+
+        def _merge_payees(src: dict[str, list]) -> None:
+            for name, (c, u) in src.items():
+                agg = payees.setdefault(name, [0, 0.0])
+                agg[0] += c
+                agg[1] += u
+
+        best_ap_count, best_ap_by_date, best_ap_payees = 0, {}, {}
+        for table_key in ap_keys:
+            count, by_date, display, tbl_payees = _summ(table_key)
+            if count > 0 and display and display not in sources:
+                sources.append(display)
+            if count > best_ap_count:
+                best_ap_count, best_ap_by_date, best_ap_payees = count, by_date, tbl_payees
+        if best_ap_count:
+            total_count += best_ap_count
+            for day_key, usd in best_ap_by_date.items():
+                usd_by_date[day_key] = usd_by_date.get(day_key, 0.0) + usd
+            _merge_payees(best_ap_payees)
+
+        for table_key in other_keys:
+            count, by_date, display, tbl_payees = _summ(table_key)
             if count > 0:
                 total_count += count
                 for day_key, usd in by_date.items():
                     usd_by_date[day_key] = usd_by_date.get(day_key, 0.0) + usd
                 if display and display not in sources:
                     sources.append(display)
+                _merge_payees(tbl_payees)
+
+        payee_breakdown = sorted(
+            ((n, c, round(u, 2)) for n, (c, u) in payees.items()),
+            key=lambda x: x[2], reverse=True,
+        )
 
         return ScopeTxnSummary(
             scope_id=scope_id,
@@ -567,6 +845,7 @@ class TransactionalDataAnalysisAgent:
             table_sources=sources,
             doc_sources=[doc_label],
             has_data=total_count > 0,
+            payee_breakdown=payee_breakdown,
         )
 
     def _name_list_for_scope(self, scope_id: str, keywords: tuple[str, ...]) -> list[str]:
@@ -624,17 +903,15 @@ class TransactionalDataAnalysisAgent:
                     names.append(val)
             logger.info("[%s] %s — supporting doc '%s' | entity_col=%s | entities=%d",
                         AGENT_TRANSACTIONAL_ANALYSIS, scope_id, chosen["name"], entity_col, len(names))
-            # Keep original + English variants so these names match a ledger in either language
-            # (same discipline as the TPI inventory).
             try:
                 from src.services.translation import TranslationService
 
                 names = TranslationService(self._settings, llm=self._llm).augment_with_english(names)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("[%s] %s — name English-augmentation skipped | %s",
                                AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
             return names
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] %s — supporting-doc entity extraction failed | %s",
                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
             return []
@@ -650,7 +927,6 @@ class TransactionalDataAnalysisAgent:
                 with open(local_path, newline="", encoding="utf-8-sig", errors="ignore") as fh:
                     all_rows = [row for row in csv.reader(fh)]
             elif suffix == ".xls":
-                # openpyxl cannot read the legacy .xls format — use pandas (xlrd engine).
                 import pandas as pd
                 df = pd.read_excel(local_path, sheet_name=0, header=None, dtype=object)
                 all_rows = [
@@ -662,12 +938,11 @@ class TransactionalDataAnalysisAgent:
                 ws = wb[wb.sheetnames[0]]
                 all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
                 wb.close()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             hint = " (install xlrd or save as .xlsx)" if suffix == ".xls" else ""
             logger.warning("[%s] Could not read supporting-doc sheet %s%s | %s",
                            AGENT_TRANSACTIONAL_ANALYSIS, local_path.name, hint, exc)
             return [], []
-        # First row with >= 2 non-empty cells is the header.
         header_idx = next(
             (i for i, r in enumerate(all_rows) if sum(1 for c in r if c not in (None, "")) >= 2),
             None,
@@ -704,10 +979,9 @@ class TransactionalDataAnalysisAgent:
             col = (json.loads(raw).get("entity_column") or "").strip()
             if col in headers:
                 return col
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] %s — entity-column mapping failed, using heuristic | %s",
                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
-        # Heuristic fallback: first header that looks like an entity name column.
         for kw in ("name", "vendor", "supplier", "distributor", "entity", "party", "tpi", "organisation", "organization"):
             for h in headers:
                 if h and kw in h.lower():
@@ -753,10 +1027,9 @@ class TransactionalDataAnalysisAgent:
             col = (json.loads(raw).get("amount_column") or "").strip()
             if col and col in headers:
                 return col
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] %s — amount-column mapping failed, using heuristic | %s",
                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
-        # Heuristic fallback: prefer a USD money column, then a generic money column.
         for h in headers:
             if h and "usd" in h.lower() and self._looks_like_money_header(h):
                 return h
@@ -808,9 +1081,6 @@ class TransactionalDataAnalysisAgent:
                 return 0, {}
             amount_col = self._map_amount_column(scope_id, headers, rows[:5])
             if amount_col is None or amount_col not in headers:
-                # Pure name/entity list (no money column) — these are entities, NOT transactions, so we
-                # report nothing on the doc side. The scope's real count/amount must come from the
-                # dashboards (table side); we no longer surface the misleading entity-list count here.
                 logger.info("[%s] %s — no amount column in doc '%s' — doc side left blank (entity list, not transactions) (headers=%s)",
                             AGENT_TRANSACTIONAL_ANALYSIS, scope_id, chosen["name"], headers)
                 return 0, {}
@@ -832,21 +1102,22 @@ class TransactionalDataAnalysisAgent:
                         AGENT_TRANSACTIONAL_ANALYSIS, scope_id, chosen["name"], amount_col,
                         count, sum(by_date.values()))
             return count, by_date
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] %s — doc amount extraction failed | %s",
                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
             return 0, {}
 
     def _name_filtered_table_summary(
         self, table_key: str, name_hints: tuple[str, ...], names: list[str]
-    ) -> tuple[int, dict[str, float], str | None]:
+    ) -> tuple[int, dict[str, float], str | None, dict[str, list]]:
         """Count + USD-by-date of this audit's rows on `table_key` whose name column matches `names`.
-        Returns (count, usd_by_date, friendly_table_name) — (0, {}, None) when the table is missing,
-        has no usable name/USD column, or matches nothing. Amounts summed only from a `*_USD` column."""
+        Returns (count, usd_by_date, friendly_table_name, payees) — payees maps each MATCHED payee to
+        [txn_count, total_usd]. (0, {}, None, {}) when the table is missing, has no usable name/USD
+        column, or matches nothing. Amounts summed only from a `*_USD` column."""
         table = self._settings.dashboard_tables.get(table_key)
         if not table or not names:
-            return 0, {}, None
-        schema = self._get_table_schema(table)          # [(name, dtype), ...]
+            return 0, {}, None, {}
+        schema = self._get_table_schema(table)
         cols = [name for name, _ in schema]
         dtype_by_col = {name: (dtype or "").lower() for name, dtype in schema}
 
@@ -858,8 +1129,6 @@ class TransactionalDataAnalysisAgent:
                         return col
             return None
 
-        # Prefer the actual payee *_NAME column (e.g. SUPPLIER_NAME / CUSTOMER_NAME), never an ID/code
-        # column (SUPPLIER_IDENTIFIER, VENDOR_ID). Fall back to a hint-only match if no *_NAME exists.
         def _pick_name(hints: tuple[str, ...]) -> str | None:
             for hint in hints:
                 for col in cols:
@@ -870,8 +1139,6 @@ class TransactionalDataAnalysisAgent:
 
         name_col = _pick_name(name_hints)
         usd_col = _pick(("usd",))
-        # Date column: pick a genuinely DATE/TIMESTAMP-typed column — NOT a column merely named
-        # '*_date' (e.g. COUNTDISTINCT_INVOICE_POSTING_DATE is a BIGINT count and must not be cast).
         date_col = next(
             (
                 name for name in cols
@@ -884,17 +1151,13 @@ class TransactionalDataAnalysisAgent:
             logger.info("[%s] DD skip table %s — no usable %s column",
                         AGENT_TRANSACTIONAL_ANALYSIS, table_key,
                         "name" if not name_col else "USD amount")
-            return 0, {}, None
+            return 0, {}, None, {}
 
-        # Normalise each TPI name to a TOKEN SET (suffix/punctuation/case-insensitive). Exact-string
-        # matching misses SAP payee variants ('PTY LTD', '(NZ)', 'trading as …'), so a payee matches a
-        # TPI when one normalised token set is a subset of the other (guarded against trivial matches).
         def _token_set(value) -> frozenset[str]:
             return frozenset(_normalize_entity(value).split())
 
         def _significant(ts: frozenset[str]) -> bool:
-            # avoid matching on a single short/common token (e.g. just "HEALTH")
-            return len(ts) >= 2 or any(len(t) >= 5 for t in ts)
+            return len(ts) >= 2 or any(len(t) >= 5 or (len(t) >= 2 and _CJK_RE.search(t)) for t in ts)
 
         tpi_sets = {ts for ts in (_token_set(n) for n in names) if ts}
 
@@ -905,12 +1168,8 @@ class TransactionalDataAnalysisAgent:
                 small, big = (ts, payee_ts) if len(ts) <= len(payee_ts) else (payee_ts, ts)
                 if not small or not _significant(small):
                     continue
-                # Clean same-entity signal: every distinctive token of the shorter name is present.
                 if small.issubset(big):
                     return True
-                # Tolerate ONE differing qualifier token (e.g. "... INTERNATIONAL" vs "... INDONESIA")
-                # but only for names of 3+ tokens and only when >=2 shared tokens overlap, one of them
-                # distinctive (len>=4). Short names stay strict so unrelated payees are never merged.
                 inter = small & big
                 if len(small) >= 3 and len(inter) >= len(small) - 1 and len(inter) >= 2 \
                         and any(len(t) >= 4 for t in inter):
@@ -918,9 +1177,8 @@ class TransactionalDataAnalysisAgent:
             return False
 
         if not tpi_sets:
-            return 0, {}, None
+            return 0, {}, None, {}
 
-        # Pull per-payee, per-date aggregates for THIS audit, then match payees in Python.
         clause = self._settings.engagement_filter_clause
         where = f"WHERE {clause} " if clause else ""
         date_expr = f"try_cast(`{date_col}` AS DATE)" if date_col else "CAST(NULL AS DATE)"
@@ -935,6 +1193,7 @@ class TransactionalDataAnalysisAgent:
         by_date: dict[str, float] = {}
         matched_payees: set[str] = set()
         all_payees: set[str] = set()
+        payee_tot: dict[str, list] = {}
         for r in rows:
             payee = r.get("payee")
             if payee:
@@ -949,6 +1208,9 @@ class TransactionalDataAnalysisAgent:
             by_date[key] = by_date.get(key, 0.0) + u
             if payee:
                 matched_payees.add(str(payee))
+                agg = payee_tot.setdefault(str(payee), [0, 0.0])
+                agg[0] += c
+                agg[1] += u
         display = self._dashboard_source_name(table) if count > 0 else None
         logger.info(
             "[%s] DD table %s | name_col=%s | matched_txns=%d | matched_payees=%d (%s)",
@@ -962,42 +1224,180 @@ class TransactionalDataAnalysisAgent:
                 sorted(all_payees)[:8] or "none",
                 [" ".join(sorted(ts)) for ts in list(tpi_sets)[:8]],
             )
-        return count, by_date, display
+        return count, by_date, display, payee_tot
+
+    def _pricing_discount_summary(self, scope_id: str) -> ScopeTxnSummary | None:
+        """Pricing/Discounts scope: ONE row, but the Amount cell carries BOTH tagged values —
+        'Sales: USD <sales>; Discount: USD <discount>' — computed deterministically from the Revenue
+        table over TRANSACTION_TYPE='Sale' (SALES_AMOUNT and ACTUAL_DISCOUNT_AMOUNT, both USD).
+        total_usd stays = sales for any numeric roll-up. None → caller uses the normal path."""
+        table = self._settings.dashboard_tables.get("revenue")
+        if not table:
+            return None
+        clause = self._settings.engagement_filter_clause
+        sale_pred = "UPPER(try_cast(`TRANSACTION_TYPE` AS STRING)) = 'SALE'"
+        where = f"WHERE {clause} AND {sale_pred}" if clause else f"WHERE {sale_pred}"
+        sql = (
+            "SELECT COUNT(*) AS txn_count, "
+            "SUM(try_cast(`SALES_AMOUNT` AS DOUBLE)) AS sales_usd, "
+            "SUM(try_cast(`ACTUAL_DISCOUNT_AMOUNT` AS DOUBLE)) AS discount_usd "
+            f"FROM {table} {where}"
+        )
+        try:
+            rows = self._run_sql(sql)
+        except Exception as exc:
+            logger.warning("[%s] pricing/discount summary failed — falling back | %s",
+                           AGENT_TRANSACTIONAL_ANALYSIS, str(exc)[:160])
+            return None
+        if not rows:
+            return None
+        r = rows[0]
+        cnt = int(self._coerce_number(r.get("txn_count")) or 0)
+        sales = float(self._coerce_number(r.get("sales_usd")) or 0.0)
+        disc = float(self._coerce_number(r.get("discount_usd")) or 0.0)
+        return ScopeTxnSummary(
+            scope_id=scope_id,
+            txn_count=cnt,
+            total_usd=round(sales, 2),
+            usd_by_date={"": round(sales, 2)},
+            table_sources=[self._dashboard_source_name(table)] if cnt > 0 else [],
+            has_data=cnt > 0,
+            amount_display_override=f"Sales: USD {sales:,.2f}; Discount: USD {disc:,.2f}",
+        )
+
+    def _product_samples_summary(self, scope_id: str) -> ScopeTxnSummary | None:
+        """Product Samples: report sample transactions from a SINGLE dashboard — whichever of OTC or
+        Revenue actually HAS the sample rows (not a sum of both). Filters SALE_TYPE_DESCRIPTION ~ 'sample'
+        on each table that has the column and returns the FIRST one with data, using that table's own USD
+        column (SALES_AMOUNT on Revenue, a *_USD column on OTC). None → caller uses the normal path."""
+        clause = self._settings.engagement_filter_clause
+        for key in ("otc", "revenue"):
+            fqn = self._settings.dashboard_tables.get(key)
+            if not fqn:
+                continue
+            try:
+                schema = self._get_table_schema(fqn)
+            except Exception:  # noqa: BLE001
+                continue
+            up = {c.upper(): c for c, _ in schema}
+            if "SALE_TYPE_DESCRIPTION" not in up:
+                continue
+            sale_col = up["SALE_TYPE_DESCRIPTION"]
+            usd_col = up.get("SALES_AMOUNT") or next((c for c, _ in schema if "usd" in c.lower()), None)
+            date_col = next(
+                (c for c, d in schema
+                 if ("date" in (d or "").lower() or "timestamp" in (d or "").lower())
+                 and not any(x in c.lower() for x in ("count", "distinct", "num", "qty"))),
+                None,
+            )
+            date_expr = f"try_cast(`{date_col}` AS DATE)" if date_col else "CAST(NULL AS DATE)"
+            amt_expr = (f"SUM(COALESCE(try_cast(`{usd_col}` AS DOUBLE), 0))" if usd_col
+                        else "CAST(0 AS DOUBLE)")
+            where = f"WHERE {clause} AND " if clause else "WHERE "
+            sql = (
+                f"SELECT {date_expr} AS txn_date, COUNT(*) AS txn_count, {amt_expr} AS total_usd "
+                f"FROM {fqn} {where}LOWER(try_cast(`{sale_col}` AS STRING)) LIKE '%sample%' "
+                f"GROUP BY {date_expr}"
+            )
+            try:
+                rows = self._run_sql(sql)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] product-samples %s query failed | %s",
+                               AGENT_TRANSACTIONAL_ANALYSIS, key, str(exc)[:140])
+                continue
+            usd_by_date: dict[str, float] = {}
+            count = 0
+            for r in rows:
+                c = int(self._coerce_number(r.get("txn_count")) or 0)
+                u = float(self._coerce_number(r.get("total_usd")) or 0.0)
+                day = r.get("txn_date")
+                dk = "" if day in (None, "") else str(day)[:10]
+                count += c
+                usd_by_date[dk] = usd_by_date.get(dk, 0.0) + u
+            if count > 0:   # first dashboard that actually has sample rows wins — no summation
+                return ScopeTxnSummary(
+                    scope_id=scope_id,
+                    txn_count=count,
+                    total_usd=round(sum(usd_by_date.values()), 2),
+                    usd_by_date=usd_by_date,
+                    table_sources=[self._dashboard_source_name(fqn)],
+                    has_data=True,
+                )
+        return None
 
     def _scope_summary_for(self, scope_id: str, guidance: dict[str, str], table_info: str) -> ScopeTxnSummary:
         """Generate + run ONE count/USD-by-date summary query for a scope; aggregate into a summary."""
-        # Name-list scopes (Due Diligence via TPI inventory; AP-to-distributors / PSP / Tenders via an
-        # auto-discovered supporting-doc list) have no single-table category filter — their population is
-        # an entity list filtered across the dashboards. Handle those on the deterministic name-list path.
         resolved = _resolve_scope_id(scope_id.replace("_", " ")) or scope_id.strip().upper()
         cfg = _NAME_LIST_SCOPES.get(resolved)
         if cfg:
             keywords, table_keys, doc_label = cfg
             names = self._name_list_for_scope(resolved, keywords)
             summary = self._name_list_summary(resolved, names, table_keys, doc_label)
-            # DOC SIDE (additive): sum the supporting-doc's own amount column, if it has one, so the
-            # sheet's doc count/amount are real figures — not just a source label. Leaves the doc side
-            # blank (today's behaviour) when the doc has no amount column.
             doc_count, doc_by_date = self._supporting_doc_amount_summary(resolved, keywords)
-            # Doc side is populated ONLY when the supporting doc has a genuine money/amount column
-            # (real doc-side transactions). A pure name/entity list (TPI inventory, distributor list)
-            # contributes NO count/amount — those are entities, not transactions. The scope's actual
-            # figures come from the dashboards (table side above); the doc only provides the col-E label.
             if doc_count:
                 summary.doc_txn_count = doc_count
                 summary.doc_usd_by_date = doc_by_date
                 summary.doc_total_usd = round(sum(doc_by_date.values()), 2)
                 summary.has_data = summary.has_data or doc_count > 0
-            return summary
+            if summary.has_data or doc_count or resolved not in _SCOPE_FALLBACK_DASHBOARD:
+                return summary
+            logger.info("[%s] %s name-list empty — falling through to AP dashboard fallback",
+                        AGENT_TRANSACTIONAL_ANALYSIS, resolved)
 
-        category_filter = self._resolve_scope_category_filter(scope_id)
+        if resolved == "PRICING__DISCOUNTS__MARGINS__DISTRIBUTORS":
+            pd_summary = self._pricing_discount_summary(scope_id)
+            if pd_summary is not None:
+                return pd_summary
+
+        if resolved == "PRODUCT_SAMPLES":
+            ps_summary = self._product_samples_summary(scope_id)
+            if ps_summary is not None:
+                return ps_summary
+
+        category_filter = self._resolve_scope_category_filter(scope_id, prefer_hcc=True)
+
+        fallback_keys = _SCOPE_FALLBACK_DASHBOARD.get(resolved)
+        dashboard_hint = ""
         if not category_filter:
-            return ScopeTxnSummary(scope_id=scope_id)
+            if not fallback_keys:
+                return ScopeTxnSummary(scope_id=scope_id)
+            fqns = [self._settings.dashboard_tables[k] for k in fallback_keys
+                    if k in self._settings.dashboard_tables]
+            if not fqns:
+                return ScopeTxnSummary(scope_id=scope_id)
+            if len(fqns) > 1:
+                dashboard_hint = (
+                    "\n\nPRIMARY DASHBOARD(S) FOR THIS SCOPE — use ONLY these (the Payment + Disbursement "
+                    f"AP dashboards): {', '.join(fqns)}. They MIRROR the same AP payments, so UNION ALL "
+                    "both and DE-DUPLICATE (one row per COMPANY_CODE, INVOICE_NUMBER, "
+                    "try_cast(DOCUMENT_CURRENCY_INVOICE_AMT_USD AS DOUBLE), INVOICE_POSTING_DATE) before "
+                    "counting/summing — NEVER sum the two tables (that double-counts). Restrict to THIS "
+                    "scope's relevant transactions using the Scope Description above."
+                )
+            else:
+                dashboard_hint = (
+                    f"\n\nPRIMARY DASHBOARD FOR THIS SCOPE — use ONLY this table: {fqns[0]}. Restrict to "
+                    "THIS scope's relevant transactions using the Scope Description above."
+                )
+        else:
+            # category_filter present: if its column lives on exactly ONE dashboard (e.g.
+            # SALE_TYPE_DESCRIPTION for Product Samples -> OTC, not Revenue), force the summary onto that
+            # table. Otherwise the LLM may query a different dashboard that lacks the column → the whole
+            # query fails with UNRESOLVED_COLUMN and the scope silently shows nothing.
+            host = self._table_for_category_columns(category_filter)
+            if host:
+                dashboard_hint = (
+                    f"\n\nPRIMARY DASHBOARD FOR THIS SCOPE — use ONLY this table: {host}. It is the table "
+                    "that holds the SCOPE CATEGORY FILTER column(s); do NOT query any other table."
+                )
+
         user_msg = SCOPE_SUMMARY_SQL_USER_TEMPLATE.format(
             scope_area=scope_id,
             engagement_filter=self._engagement_filter,
-            category_filter=category_filter or "(none — use the real CATEGORY values listed in the table info)",
-            scope_description=guidance.get("scope_description") or "Not available for this scope area.",
+            scope_period_filter=self._scope_period_filter,
+            category_filter=category_filter
+                or "(none — compute the scope-relevant population on the mapped dashboard per the guidance below)",
+            scope_description=(guidance.get("scope_description") or "Not available for this scope area.") + dashboard_hint,
             table_info=table_info or "Table schema not available.",
         )
         response = self._llm.invoke([
@@ -1018,8 +1418,36 @@ class TransactionalDataAnalysisAgent:
             return ScopeTxnSummary(scope_id=scope_id)
         if category_filter:
             sql = self._enforce_category_filter(sql, category_filter)
+        # Same permanent apostrophe/punctuation fix as the calc path: the Output F summary SQL also
+        # filters REQUEST_TYPE / CATEGORY, so normalise those predicates to alphanumeric-only on both
+        # sides — otherwise a typographic apostrophe in the data (HCP’s) silently returns 0 here too.
+        sql, _changed = self._normalize_category_predicates(sql)
 
-        rows = self._run_sql(sql)
+        # Column guard (same as the calc path): the summary SQL can reference a column the LLM invented or
+        # that does not exist on the table it chose (e.g. REQUEST_TYPE on the T&E dashboard for Market
+        # Access), which fails the WHOLE query and silently drops the scope. Validate against the shown
+        # schema and repair (drop the offending predicate, keep the aggregate) before running.
+        cols_by_table = self._known_columns_by_table(table_info)
+        bad = self._unknown_columns(sql, cols_by_table)
+        if bad:
+            pre_err = (
+                "Pre-execution validation: column(s) " + ", ".join(bad) + " are NOT in the table schema "
+                "and WILL fail with UNRESOLVED_COLUMN. Remove the predicate/metric that uses each one (do "
+                "NOT invent a substitute). Keep exactly the output columns txn_date, txn_count = COUNT(*), "
+                "total_usd, and keep the engagement + scope-period filters."
+            )
+            repaired = self._repair_calc_sql(scope_id, "scope transaction summary", sql, pre_err, table_info)
+            if repaired and not self._unknown_columns(repaired, cols_by_table):
+                logger.info("[%s] Output F summary column-repaired | scope=%s | removed=%s",
+                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, ", ".join(bad))
+                sql = repaired
+
+        try:
+            rows = self._run_sql(sql)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Output F summary SQL failed | scope=%s | %s",
+                           AGENT_TRANSACTIONAL_ANALYSIS, scope_id, str(exc)[:160])
+            return ScopeTxnSummary(scope_id=scope_id)
         usd_by_date: dict[str, float] = {}
         txn_count = 0
         for r in rows:
@@ -1098,11 +1526,9 @@ class TransactionalDataAnalysisAgent:
         yields one row; samples are pulled only for an actual risk, sized to the scope's
         Expected Sample Size (CPR col K) + buffer.
         """
-        # Steps 1 & 2 — run this scope's own Data Calculations against the tables.
         calc_results, calc_sqls = self._run_scope_calculations(scope_id, guidance, table_info)
         data_for_judgment = calc_results or fallback_summary
 
-        # Step 3 — judge risk on the scope-specific computed data.
         finding = self._analyze_with_ai(scope_id, guidance, data_for_judgment, table_info)
         if not finding:
             finding = {
@@ -1112,7 +1538,7 @@ class TransactionalDataAnalysisAgent:
             }
 
         expected_size = self._parse_sample_size(guidance.get("expected_sample_size", ""))
-        target_samples = expected_size  # pull exactly the CPR expected sample size (no buffer)
+        target_samples = expected_size
 
         risk_type_str = (finding.get("risk_type") or "").lower()
         is_actual_risk = "potential" in risk_type_str or "further" in risk_type_str
@@ -1128,9 +1554,6 @@ class TransactionalDataAnalysisAgent:
         )
         return [self._to_risk_output(scope_id, finding, samples_text, calc_results, calc_sqls)]
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # CPR Guidance Loading
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _load_all_cpr_guidance(self) -> dict[str, dict[str, str]]:
         """Load guidance for EVERY scope area in one pass over the CPR file.
@@ -1185,8 +1608,6 @@ class TransactionalDataAnalysisAgent:
                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id)
             return {}
 
-        # The incoming scope_id may be the config value ("tpi_due_diligence") rather than a
-        # CPR scope key ("DUE_DILIGENCE"). Normalise it so it matches a sheet's resolved id.
         target_scope = _resolve_scope_id(scope_id.replace("_", " ")) or scope_id.strip().upper()
         if target_scope != scope_id:
             logger.info("[%s] Normalised scope for CPR match | %s → %s",
@@ -1221,9 +1642,6 @@ class TransactionalDataAnalysisAgent:
                          AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
         return {}
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Transactional Data Summary
-    # ──────────────────────────────────────────────────────────────────────────
 
     def pull_table_info(self) -> str:
         """Introspect the 7 dashboard tables (schema only, no aggregates) and return their column
@@ -1248,9 +1666,6 @@ class TransactionalDataAnalysisAgent:
             try:
                 schema = self._get_table_schema(table)
                 cols = [name for name, _ in schema]
-                # Distinct categorical values go into table_info so the CALC-SQL builder (which only
-                # receives table_info, not the summary) filters scopes on REAL values like
-                # 'Event Invitee' / 'Fee for Service' instead of guessing '%CONGRESS%'/'%FFS%'.
                 cat_lines = self._categorical_values_block(table, cols, self._engagement_where())
                 info = self._table_info_line(table, schema)
                 if cat_lines:
@@ -1354,9 +1769,87 @@ class TransactionalDataAnalysisAgent:
         cols = ", ".join(f"`{name}` ({dtype})" for name, dtype in schema)
         return f"Table: {table}\nColumns: {cols}"
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Scope Calculations (execute the CPR Data Calculations per scope)
-    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _known_columns_by_table(table_info: str) -> dict[str, set[str]]:
+        """Parse the table_info the LLM was shown into {base_table_name_lower: {UPPER column names}}.
+        _table_info_line emits `Table: <catalog.schema.name>` then `Columns: `c1` (t), `c2` (t) …`, so
+        we attribute each backtick-quoted column to the most recent `Table:` header. Empty dict => a
+        parse miss, which the caller treats as "skip validation" rather than flagging good columns."""
+        by_table: dict[str, set[str]] = {}
+        current: str | None = None
+        for line in (table_info or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Table:"):
+                raw = stripped[len("Table:"):].strip().split()[0] if stripped[len("Table:"):].strip() else ""
+                current = raw.split(".")[-1].strip("`").lower() or None
+                if current:
+                    by_table.setdefault(current, set())
+            elif current:
+                for col in re.findall(r"`([A-Za-z0-9_]+)`", line):
+                    by_table[current].add(col.upper())
+        return by_table
+
+    @classmethod
+    def _unknown_columns(cls, sql: str, by_table: dict[str, set[str]]) -> list[str]:
+        """UPPER_SNAKE tokens in `sql` that are NOT a real column of the table(s) the query reads, NOT a
+        SQL keyword, NOT a function call, and NOT an alias the query itself defines — i.e. columns the
+        LLM invented (or a real column used on a table that lacks it). Order-preserving + unique.
+
+        Validation is scoped to the tables actually referenced in FROM/JOIN, so a column that exists on
+        another dashboard is still flagged when used on a table without it (e.g. GOVERNMENT_VENDORS on
+        payment/disbursement). Returns [] when nothing can be resolved, so a parse miss never over-flags."""
+        if not by_table or not sql:
+            return []
+        stripped = _SQL_STRING_LITERAL_RE.sub(" ", sql)
+
+        referenced = {
+            m.split(".")[-1].strip("`").lower()
+            for m in _FROM_JOIN_RE.findall(stripped)
+        }
+        valid: set[str] = set()
+        for tbl in referenced:
+            valid |= by_table.get(tbl, set())
+        if not valid:
+            for cols in by_table.values():
+                valid |= cols
+
+        defined = {m.upper() for m in _AS_ALIAS_RE.findall(stripped)}
+        defined |= {m.upper() for m in _CTE_NAME_RE.findall(stripped)}
+
+        unknown: list[str] = []
+        seen: set[str] = set()
+        for m in _UPPER_IDENT_RE.finditer(stripped):
+            tok = m.group(0)
+            if tok in seen or tok in valid or tok in defined or tok in _SQL_RESERVED_TOKENS:
+                continue
+            rest = stripped[m.end():]
+            if rest.lstrip().startswith("("):
+                continue
+            seen.add(tok)
+            unknown.append(tok)
+        return unknown
+
+    @classmethod
+    def _autocorrect_columns(cls, sql: str, by_table: dict[str, set[str]]) -> tuple[str, list[str]]:
+        """Deterministically fix near-miss column TYPOS before execution: any invented UPPER_SNAKE
+        identifier that CLOSELY matches a real column (e.g. EQUIPEMENT_SCORE -> EQUIPMENT_SCORE) is
+        replaced in place. Genuinely invented columns with no close real match (e.g. ADVANCE_PAYMENT)
+        are left untouched for the normal guard/repair to drop. Returns (sql, ['TYPO->REAL', ...])."""
+        import difflib
+        unknown = cls._unknown_columns(sql, by_table)
+        if not unknown:
+            return sql, []
+        valid = sorted({c for cols in by_table.values() for c in cols})
+        if not valid:
+            return sql, []
+        fixes: list[str] = []
+        for tok in unknown:
+            match = difflib.get_close_matches(tok, valid, n=1, cutoff=0.85)
+            if match and match[0] != tok:
+                sql = re.sub(rf"\b{re.escape(tok)}\b", match[0], sql)
+                fixes.append(f"{tok}->{match[0]}")
+        return sql, fixes
 
     def _run_scope_calculations(
         self, scope_id: str, guidance: dict[str, str], table_info: str
@@ -1365,34 +1858,71 @@ class TransactionalDataAnalysisAgent:
         results as a text block together with the list of executed SQL queries. Returns ("", [])
         if nothing relevant could be computed."""
         queries = self._generate_calc_sql(scope_id, guidance, table_info)
+
+        tpi_block, tpi_sql = self._tpi_payment_calc_block(scope_id)
+
         if not queries:
+            if tpi_block:
+                return tpi_block, ([tpi_sql] if tpi_sql else [])
             logger.info("[%s] No scope calculations generated — falling back to generic summary | scope=%s",
                         AGENT_TRANSACTIONAL_ANALYSIS, scope_id)
             return "", []
 
+        cols_by_table = self._known_columns_by_table(table_info)
         blocks: list[str] = []
         executed_sqls: list[str] = []
+        if tpi_block:
+            blocks.append(tpi_block)
+            if tpi_sql:
+                executed_sqls.append(tpi_sql)
         n_failed = 0
         n_with_rows = 0
         n_no_rows = 0
         for q in queries:
-            purpose = (q.get("purpose") or "calculation").strip()
+            purpose = self._clean_calc_purpose(q.get("purpose") or "calculation")
             sql = (q.get("sql") or "").strip()
             if not sql:
                 continue
-            sql = self._apply_limit(sql, 25)  # hard safety cap on computed rows
+            sql = self._apply_limit(sql, 50)   # behind-the-scenes display cap (not shown in the evidence line)
+
+            sql, typo_fixes = self._autocorrect_columns(sql, cols_by_table)
+            if typo_fixes:
+                logger.info("[%s] Calc query column typos auto-corrected | scope=%s | purpose=%s | %s",
+                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, purpose, ", ".join(typo_fixes))
+
+            bad_cols = self._unknown_columns(sql, cols_by_table)
+            if bad_cols:
+                pre_err = (
+                    "Pre-execution validation: the following column(s) are NOT in the table schema and "
+                    "WILL fail with UNRESOLVED_COLUMN. Remove the metric that uses each one, or replace "
+                    "it with a real column from the AVAILABLE TABLES AND COLUMNS block — do NOT invent a "
+                    f"substitute: {', '.join(bad_cols)}"
+                )
+                repaired = self._repair_calc_sql(scope_id, purpose, sql, pre_err, table_info)
+                repaired = self._apply_limit(repaired, 50) if repaired else ""
+                if not repaired or self._unknown_columns(repaired, cols_by_table):
+                    n_failed += 1
+                    logger.warning(
+                        "[%s] Calc query excluded (hallucinated column, not repairable) | scope=%s | "
+                        "purpose=%s | columns=%s",
+                        AGENT_TRANSACTIONAL_ANALYSIS, scope_id, purpose, ", ".join(bad_cols),
+                    )
+                    continue
+                logger.info(
+                    "[%s] Calc query column-repaired before execution | scope=%s | purpose=%s | "
+                    "removed/replaced=%s",
+                    AGENT_TRANSACTIONAL_ANALYSIS, scope_id, purpose, ", ".join(bad_cols),
+                )
+                sql = repaired
+
             executed_sql = sql
-            # Dedicated workflow name of the table this calculation runs against (shown per calc block).
             table_disp = self._workflow_display(self._extract_table_from_sql(sql)) or "Not Available"
             try:
                 rows = self._run_sql(sql)
             except Exception as exc:
-                # One automatic repair attempt: feed the error + the exact table schema back to the
-                # LLM so it can fix an unresolved column / bad alias against the real columns, then
-                # re-execute. This turns the common "hallucinated column" failure into a success.
                 repaired = self._repair_calc_sql(scope_id, purpose, sql, str(exc), table_info)
                 if repaired:
-                    executed_sql = self._apply_limit(repaired, 25)
+                    executed_sql = self._apply_limit(repaired, 50)
                     try:
                         rows = self._run_sql(executed_sql)
                         logger.info("[%s] Calc query repaired and executed | scope=%s | purpose=%s",
@@ -1404,9 +1934,6 @@ class TransactionalDataAnalysisAgent:
                                        AGENT_TRANSACTIONAL_ANALYSIS, scope_id, purpose, exc2)
                         continue
                 else:
-                    # A query/tooling failure is NOT audit evidence. Exclude it from the block the AI
-                    # judges on (and that becomes Calculation Evidence), keeping it in the log only, so
-                    # a SQL error can never be promoted into a scored risk finding.
                     n_failed += 1
                     logger.warning("[%s] Calc query excluded (failed) | scope=%s | purpose=%s | error=%s",
                                    AGENT_TRANSACTIONAL_ANALYSIS, scope_id, purpose, exc)
@@ -1418,7 +1945,7 @@ class TransactionalDataAnalysisAgent:
                 continue
             n_with_rows += 1
             cols = list(rows[0].keys())
-            summary = self._summarize_calc_rows(rows, cols)
+            summary = self._summarize_full_population(executed_sql, cols) or self._summarize_calc_rows(rows, cols)
             blocks.append(
                 f"Calculation: {purpose}\nTable: {table_disp}\n"
                 f"{summary}\n{self._format_table_rows(rows, cols)}"
@@ -1429,6 +1956,18 @@ class TransactionalDataAnalysisAgent:
             "[%s] Scope calculations executed | scope=%s | queries=%d | with_rows=%d | no_rows=%d | failed_excluded=%d",
             AGENT_TRANSACTIONAL_ANALYSIS, scope_id, len(queries), n_with_rows, n_no_rows, n_failed,
         )
+        if n_with_rows == 0:
+            if tpi_block:
+                logger.info(
+                    "[%s] Generic calc queries empty; retaining deterministic in-scope-payee block | scope=%s",
+                    AGENT_TRANSACTIONAL_ANALYSIS, scope_id,
+                )
+                return _CALC_BLOCK_SEPARATOR.join(blocks), executed_sqls
+            logger.info(
+                "[%s] All calc queries returned no rows — falling back to the generic data summary | scope=%s",
+                AGENT_TRANSACTIONAL_ANALYSIS, scope_id,
+            )
+            return "", executed_sqls
         return _CALC_BLOCK_SEPARATOR.join(blocks), executed_sqls
 
     def _repair_calc_sql(
@@ -1455,28 +1994,28 @@ class TransactionalDataAnalysisAgent:
                 if raw.lower().startswith("sql"):
                     raw = raw[3:]
                 raw = raw.strip()
-            # Guard against a non-SQL refusal / empty answer.
             if not raw or "select" not in raw.lower():
                 return ""
             return raw
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] Calc SQL repair failed | scope=%s | purpose=%s | error=%s",
                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, purpose, exc)
             return ""
 
     def _generate_calc_sql(self, scope_id: str, guidance: dict[str, str], table_info: str) -> list[dict]:
         """Ask the LLM to turn the scope's Data Calculations into concrete SQL queries."""
+        category_filter = self._resolve_scope_category_filter(scope_id)
         user_msg = CALC_SQL_USER_TEMPLATE.format(
             scope_area=scope_id,
             engagement_filter=self._engagement_filter,
-            category_filter=self._resolve_scope_category_filter(scope_id)
+            scope_period_filter=self._scope_period_filter,
+            category_filter=category_filter
                 or "(none — infer the activity filter from the real CATEGORY values listed in the table info)",
             data_calculations=guidance.get("data_calculations")
                 or "Not available — use your own FCPA audit intelligence to decide what to compute.",
             red_flags=guidance.get("red_flags") or "Not available.",
             table_info=table_info or "Table schema not available.",
         )
-        # Tenders only: append the IDR tender-list so the Payments cross-check can target real entities.
         tender_ctx = self._tender_context_for(scope_id)
         if tender_ctx:
             user_msg = f"{user_msg}\n\n{tender_ctx}"
@@ -1493,15 +2032,33 @@ class TransactionalDataAnalysisAgent:
                 raw = raw.strip()
             parsed = json.loads(raw)
             queries = parsed.get("queries", []) if isinstance(parsed, dict) else []
-            return [q for q in queries if isinstance(q, dict) and q.get("sql")]
+            queries = [q for q in queries if isinstance(q, dict) and q.get("sql")]
+            if scope_id in _HCC_SCOPE_CATEGORY_VALUES and category_filter:
+                names = self._settings.all_dashboard_table_names
+                hcc_fragments = [
+                    str(names.get(k, "")).split(".")[-1].strip("`").lower()
+                    for k in _HCC_CATEGORY_TABLE_KEYS if names.get(k)
+                ]
+                for q in queries:
+                    low = q["sql"].lower()
+                    if any(frag and frag in low for frag in hcc_fragments):
+                        q["sql"] = self._enforce_category_filter(q["sql"], category_filter)
+            # PERMANENT apostrophe/punctuation fix: rewrite every REQUEST_TYPE / CATEGORY filter to
+            # compare the ALPHANUMERIC-ONLY UPPER form of both sides, so a typographic apostrophe in the
+            # stored value (HCP’s) vs the straight one the LLM writes (HCP''s) can no longer miss. Static,
+            # no DB lookup, no LLM — applied to every HCC-category scope's queries.
+            if scope_id in _HCC_SCOPE_CATEGORY_VALUES or scope_id in _SCOPE_CATEGORY_RESOLVER_MAP:
+                for q in queries:
+                    q["sql"], changed = self._normalize_category_predicates(q["sql"])
+                    if changed:
+                        logger.info("[%s] Calc category predicate made apostrophe/punctuation-insensitive "
+                                    "| scope=%s", AGENT_TRANSACTIONAL_ANALYSIS, scope_id)
+            return queries
         except Exception as exc:
             logger.warning("[%s] Calc SQL generation failed | scope=%s | error=%s",
                            AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
             return []
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # AI Analysis
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _analyze_with_ai(
         self,
@@ -1513,6 +2070,7 @@ class TransactionalDataAnalysisAgent:
         user_msg = ANALYSIS_USER_TEMPLATE.format(
             scope_area=scope_id,
             engagement_filter=self._engagement_filter,
+            scope_period_filter=self._scope_period_filter,
             scope_description=guidance.get("scope_description") or "Not available for this scope area.",
             red_flags=guidance.get("red_flags") or "Not available for this scope area.",
             data_calculations=guidance.get("data_calculations") or "Not available for this scope area.",
@@ -1521,17 +2079,12 @@ class TransactionalDataAnalysisAgent:
             table_info=table_info or "Table schema not available.",
             data_summary=data_summary or "No transactional data available.",
         )
-        # Append the auditor's TPI inventory so the analysis can match suppliers/payees to
-        # in-scope TPIs (e.g. GL-mismatch: is this vendor an in-scope TPI?).
         if self._tpi_inventory_block:
             user_msg = f"{user_msg}\n\n{self._tpi_inventory_block}"
-        # Append the HCC GL account map so GL codes are verified against the approved mapping.
         if self._gl_account_map_block:
             user_msg = f"{user_msg}\n\n{self._gl_account_map_block}"
-        # Append the MAP/GACS remediation register so an already-closed finding is not re-raised as open.
         if self._remediation_register_block:
             user_msg = f"{user_msg}\n\n{self._remediation_register_block}"
-        # Tenders only: append the IDR tender-list so the judgment can reason over the tendering entities.
         tender_ctx = self._tender_context_for(scope_id)
         if tender_ctx:
             user_msg = f"{user_msg}\n\n{tender_ctx}"
@@ -1548,8 +2101,6 @@ class TransactionalDataAnalysisAgent:
                     raw = raw[4:]
                 raw = raw.strip()
             parsed = json.loads(raw)
-            # Prompt returns a single consolidated object per scope. Tolerate a stray
-            # {"risks": [...]} shape by taking the first (most material) entry.
             if isinstance(parsed, dict) and isinstance(parsed.get("risks"), list):
                 parsed = parsed["risks"][0] if parsed["risks"] else {}
             if not isinstance(parsed, dict):
@@ -1562,9 +2113,6 @@ class TransactionalDataAnalysisAgent:
                          AGENT_TRANSACTIONAL_ANALYSIS, scope_id, exc)
             return {}
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Sample Rows
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _pull_samples(self, sample_query: str, limit: int) -> str:
         """Execute the LLM-generated sample query and format rows as bullet points.
@@ -1574,6 +2122,41 @@ class TransactionalDataAnalysisAgent:
             return ""
         query = self._force_select_star(sample_query)
         query = self._apply_limit(query, limit)
+        tbl = self._extract_table_from_sql(query)
+
+        def _cols_of(fqn: str) -> set[str]:
+            try:
+                return {c.upper() for c, _ in self._get_table_schema(fqn)}
+            except Exception:
+                return set()
+
+        if tbl:
+            base = tbl.split(".")[-1].strip("`").lower()
+            by_table = {base: _cols_of(tbl)}
+            query, fixes = self._autocorrect_columns(query, by_table)
+            if fixes:
+                logger.info("[%s] Sample query column typos auto-corrected | %s",
+                            AGENT_TRANSACTIONAL_ANALYSIS, ", ".join(fixes))
+            bad = self._unknown_columns(query, by_table)
+            if bad:
+                for sib_key in ("disbursement", "payment"):
+                    sib = self._settings.dashboard_tables.get(sib_key)
+                    if not sib or sib == tbl:
+                        continue
+                    sib_cols = _cols_of(sib)
+                    if sib_cols and all(b in sib_cols for b in bad):
+                        query = query.replace(tbl, sib)
+                        tbl, by_table = sib, {sib.split(".")[-1].strip("`").lower(): sib_cols}
+                        logger.info("[%s] Sample query retargeted %s -> %s (columns %s not on original)",
+                                    AGENT_TRANSACTIONAL_ANALYSIS, base, sib_key, ", ".join(bad))
+                        bad = self._unknown_columns(query, by_table)
+                        break
+            if bad:
+                logger.info("[%s] Sample query references column(s) not on %s: %s — using "
+                            "engagement-scoped sample instead", AGENT_TRANSACTIONAL_ANALYSIS, base,
+                            ", ".join(bad))
+                return self._engagement_scoped_sample(tbl, limit)
+
         try:
             rows = self._run_sql(query)
             if not rows:
@@ -1582,7 +2165,29 @@ class TransactionalDataAnalysisAgent:
         except Exception as exc:
             logger.warning("[%s] Sample query failed | error=%s | query=%s",
                            AGENT_TRANSACTIONAL_ANALYSIS, exc, query[:200])
+            if tbl:
+                fb = self._engagement_scoped_sample(tbl, limit)
+                if fb:
+                    return fb
             return f"Sample query failed: {exc}"
+
+    def _engagement_scoped_sample(self, tbl: str, limit: int) -> str:
+        """Representative rows for a scope when its sample query can't run (a referenced column is not on
+        the table and no sibling carries it). Labelled honestly so it is clear these are NOT the original
+        filtered population. '' on failure."""
+        if not tbl:
+            return ""
+        clause = self._settings.engagement_filter_clause
+        where = f"WHERE {clause} " if clause else ""
+        try:
+            rows = self._run_sql(f"SELECT * FROM {tbl} {where}LIMIT {limit}")
+        except Exception as exc:
+            logger.warning("[%s] Engagement-scoped sample failed | %s", AGENT_TRANSACTIONAL_ANALYSIS, exc)
+            return ""
+        if not rows:
+            return "No sample rows matched the query."
+        return ("(Sample query referenced an unavailable column; showing engagement-scoped sample rows "
+                "instead.)\n" + self._format_samples(rows))
 
     @staticmethod
     def _parse_sample_size(text: str) -> int:
@@ -1592,9 +2197,7 @@ class TransactionalDataAnalysisAgent:
         _DEFAULT_SAMPLE_SIZE when no usable absolute count is present."""
         if not text:
             return _DEFAULT_SAMPLE_SIZE
-        # Drop percentages ("10%") — not a usable absolute row count.
         cleaned = re.sub(r"\d+\s*%", " ", text)
-        # A range like "3-5" / "3 – 5" / "3 to 5" → take the upper bound.
         range_match = re.search(r"(\d+)\s*(?:-|–|—|to)\s*(\d+)", cleaned)
         if range_match:
             return max(int(range_match.group(1)), int(range_match.group(2)))
@@ -1637,9 +2240,6 @@ class TransactionalDataAnalysisAgent:
                 lines.append(_SAMPLE_SEPARATOR)
         return "\n".join(lines)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # RiskOutput Builder
-    # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _coerce_axis(value) -> int:
@@ -1661,14 +2261,6 @@ class TransactionalDataAnalysisAgent:
         else:
             risk_title = RiskType.NO_RISK
 
-        # Score on the SAME Likelihood x Impact matrix as the classifier — and apply the classifier's
-        # STRICT Type→Category binding (risk_classifier_prompt STEP 10): ONLY a Potential Risk is
-        # scored and banded. Further Review Required is an OPEN item pending fieldwork — it is NOT
-        # scored, carries no band, and its category is "Not Applicable". No Risk (or missing/invalid
-        # axes) is likewise unscored → "No Risk". This stops a data-quality / statutory / unfed-column
-        # driven finding (which the prompt routes to Further Review Required) from being banded Medium/
-        # Low; as "Not Applicable" it is excluded from the banded Output C view, exactly like the
-        # questionnaire path.
         likelihood = self._coerce_axis(finding.get("likelihood"))
         impact = self._coerce_axis(finding.get("impact"))
         if risk_title == RiskType.FURTHER_REVIEW:
@@ -1682,8 +2274,6 @@ class TransactionalDataAnalysisAgent:
             likelihood, impact, matrix_score = ms.likelihood, ms.impact, ms.score
             risk_category = ms.category
 
-        # Exact table name: prefer the real FROM-clause table of the query that ran; then the
-        # LLM's stated source_table (if it looks real); finally the configured tables.
         source_table = self._extract_table_from_sql(finding.get("sample_query", "") or "")
         if not source_table:
             candidate = (finding.get("source_table") or "").strip()
@@ -1717,10 +2307,6 @@ class TransactionalDataAnalysisAgent:
             matrix_score=matrix_score,
             risk_category=risk_category,
             risk_score_reasoning=score_rsn,
-            # Use the canonical display name (same map the questionnaire path applies) so Output A/C
-            # show the agreed scope label and aggregation groups transactional + questionnaire rows of
-            # the SAME scope together, not as two buckets (raw id vs display name). Falls back to the
-            # raw id if the scope is not in the map.
             scope_area=SCOPE_ID_TO_DISPLAY_NAME.get(scope_id, scope_id),
             risk_description=description,
             risk_rationale=rationale,
@@ -1767,16 +2353,40 @@ class TransactionalDataAnalysisAgent:
         return ", ".join(names)
 
     @staticmethod
+    def _clean_calc_purpose(purpose: str) -> str:
+        """Strip the row-count claim from a calc purpose shown in Calculation Evidence. The LLM writes
+        "Top 50 vendors …", but the actual result may have more or fewer rows (the LIMIT 50 is just a
+        behind-the-scenes display cap). Remove the count so the evidence line never states an exact
+        number: "Top 50 vendors by spend" -> "Top vendors by spend"."""
+        s = (purpose or "calculation").strip()
+        s = re.sub(r"\b(top|first|bottom)[\s-]+\d+\b", r"\1", s, flags=re.IGNORECASE)
+        s = re.sub(r"\blimit(?:ed)?\s+(?:to\s+)?\d+\b", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s{2,}", " ", s).strip(" -–—,;")
+        return s or "calculation"
+
+    @staticmethod
     def _extract_table_from_sql(sql: str) -> str:
-        """Return the fully-qualified table name from the FROM clause of a query (or "")."""
+        """Return the REAL dashboard table name(s) referenced in FROM/JOIN clauses, comma-joined (unique,
+        in order). Captures BOTH tables of a payment+disbursement UNION so the source reflects every table
+        used. Excludes CTE aliases (e.g. a `WITH te AS (...)` name read as `FROM te`) — those are query
+        scaffolding, NOT data sources, and must never surface in the Calculation Evidence 'Table:' line.
+        Real dashboard tables are fully qualified (catalog.schema.table); CTE aliases are bare names."""
         if not sql:
             return ""
-        m = re.search(r"\bfrom\s+([A-Za-z0-9_.`]+)", sql, re.IGNORECASE)
-        return m.group(1).strip().replace("`", "") if m else ""
+        cte_names = {m.lower() for m in _CTE_NAME_RE.findall(sql)}
+        real: list[str] = []
+        fallback: list[str] = []
+        for m in re.finditer(r"\b(?:from|join)\s+([A-Za-z0-9_.`]+)", sql, re.IGNORECASE):
+            t = m.group(1).strip().replace("`", "")
+            low = t.lower()
+            if not t or low in ("(", "select") or low in cte_names:
+                continue
+            if t not in fallback:
+                fallback.append(t)
+            if "." in t and t not in real:   # fully-qualified -> an actual dashboard table
+                real.append(t)
+        return ", ".join(real or fallback)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Utilities
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _local_reference_path(self, path_str: str) -> Path | None:
         p = Path(path_str)
@@ -1832,14 +2442,53 @@ class TransactionalDataAnalysisAgent:
         """Guarantee `category_filter` appears in the WHERE clause.
         If the LLM already included it (checked by column name), return sql unchanged.
         Otherwise inject it before GROUP BY (or at the end of the WHERE block)."""
-        col_name = category_filter.split()[0]
-        if col_name.lower() in sql.lower():
+        norm_filter = re.sub(r"\s+", " ", category_filter).strip().lower()
+        if norm_filter in re.sub(r"\s+", " ", sql).lower():
             return sql
         group_by = re.search(r"\bGROUP\s+BY\b", sql, re.IGNORECASE)
         if group_by:
             pos = group_by.start()
             return sql[:pos].rstrip() + f"\n  AND {category_filter}\n" + sql[pos:]
         return sql.rstrip() + f"\n  AND {category_filter}"
+
+    @staticmethod
+    def _normalize_category_predicates(sql: str) -> tuple[str, bool]:
+        """Make every standalone REQUEST_TYPE / CATEGORY equality or IN predicate apostrophe-, spacing-
+        and punctuation-INSENSITIVE by comparing the ALPHANUMERIC-ONLY UPPER form of BOTH the column and
+        the literal(s). Permanently fixes the class where the stored value uses a typographic apostrophe
+        (HCP’s) but the LLM wrote a straight one (HCP''s) → 0 rows. Static: no DB lookup, no LLM.
+        Returns (sql, changed). Only the exact columns REQUEST_TYPE / CATEGORY are touched (word-bounded,
+        so CATEGORY_OF_HCP_… and CATEGORY_HCP_NON_HCP are left alone)."""
+        changed = False
+
+        def _alnum(v: str) -> str:
+            return re.sub(r"[^A-Z0-9]", "", v.upper())
+
+        def _col(c: str) -> str:
+            return f"REGEXP_REPLACE(UPPER({c}), '[^A-Z0-9]', '')"
+
+        def _in(m: re.Match) -> str:
+            nonlocal changed
+            col, inner = m.group(1), m.group(2)
+            lits = [_alnum(l.replace("''", "'")) for l in re.findall(r"'((?:[^']|'')*)'", inner)]
+            lits = [x for x in lits if x]
+            if not lits:
+                return m.group(0)
+            changed = True
+            return f"{_col(col)} IN ({', '.join(chr(39) + x + chr(39) for x in lits)})"
+
+        def _eq(m: re.Match) -> str:
+            nonlocal changed
+            col, lit = m.group(1), m.group(2)
+            val = _alnum(lit.replace("''", "'"))
+            if not val:
+                return m.group(0)
+            changed = True
+            return f"{_col(col)} = '{val}'"
+
+        sql = re.sub(r"\b(REQUEST_TYPE|CATEGORY)\b\s+IN\s*\(([^)]*)\)", _in, sql, flags=re.IGNORECASE)
+        sql = re.sub(r"\b(REQUEST_TYPE|CATEGORY)\b\s*=\s*'((?:[^']|'')*)'", _eq, sql, flags=re.IGNORECASE)
+        return sql, changed
 
     @staticmethod
     def _coerce_number(value) -> float | None:
@@ -1854,6 +2503,37 @@ class TransactionalDataAnalysisAgent:
             except ValueError:
                 return None
         return None
+
+    def _summarize_full_population(self, executed_sql: str, cols: list[str]) -> str | None:
+        """FULL-POPULATION roll-up: COUNT(*) + SUM(measure) over the ENTIRE filtered population, NOT just
+        the top-50 rows displayed. Wraps the executed query (minus its trailing LIMIT) as a subquery and
+        aggregates it in SQL. Returns None on any problem so the caller can fall back to the row roll-up."""
+        inner = re.sub(r"(?is)\blimit\b\s+\d+\s*(?:offset\s+\d+\s*)?;?\s*$", "",
+                       executed_sql.rstrip().rstrip(";")).rstrip()
+        if not inner:
+            return None
+        measures = [c for c in cols if not _NON_MEASURE_COL_RE.search(c)]
+        sums = ", ".join(f"SUM(try_cast(`{c}` AS DOUBLE)) AS `{c}`" for c in measures)
+        agg_sql = f"SELECT COUNT(*) AS _row_count{(', ' + sums) if sums else ''} FROM (\n{inner}\n) _pop"
+        try:
+            res = self._run_sql(agg_sql)
+        except Exception as exc:
+            logger.warning("[%s] full-population summary failed — falling back to row roll-up | %s",
+                           AGENT_TRANSACTIONAL_ANALYSIS, str(exc)[:160])
+            return None
+        if not res:
+            return None
+        r = res[0]
+        n = int(self._coerce_number(r.get("_row_count")) or 0)
+        totals = []
+        for c in measures:
+            v = self._coerce_number(r.get(c))
+            if v is not None:
+                totals.append(f"{c}={v:,.2f}")
+        summary = f"Summary (full population): {n} row(s)"
+        if totals:
+            summary += "; " + "; ".join(totals)
+        return summary
 
     @classmethod
     def _summarize_calc_rows(cls, rows: list[dict[str, Any]], cols: list[str]) -> str:
@@ -1875,7 +2555,6 @@ class TransactionalDataAnalysisAgent:
 
     @staticmethod
     def _build_engine(settings: Settings):
-        # Pool sized for concurrent per-scope analysis (run_all uses a thread pool).
         return build_engine(
             settings,
             schema=settings.databricks_schema_name,

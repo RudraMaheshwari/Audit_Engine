@@ -30,6 +30,11 @@ class EvidenceRetrievalTool(BaseRetrievalTool):
     Two modes:
       retrieve()          — broad MQR + BM25 search across the auditor's evidence
       retrieve_targeted() — filtered to a specific document name; skips MQR, applies BM25
+
+    Goal: pull the sources a downstream agent needs to VALIDATE a finding's rationale and description.
+    Favour recall — retrieve_targeted uses a higher top_k so a large or multi-row document is covered
+    COMPLETELY, and it should be used for ANY document/record the response references (named or generic),
+    not only when the response cites a filename.
     """
 
     def __init__(
@@ -85,13 +90,25 @@ class EvidenceRetrievalTool(BaseRetrievalTool):
         # BM25 re-rank candidates → final top_k
         return self._bm25.rerank(query, candidates, top_k=effective_top_k)
 
+    def doc_names(self) -> set[str]:
+        """All supporting-doc file names indexed for this auditor (best-effort → empty set). Lets a
+        caller target specific files by name instead of relying on semantic top-k."""
+        try:
+            return self._index_manager.list_document_names("supporting", self._auditor_folder)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[EvidenceRetrievalTool] could not list doc names | %s", exc)
+            return set()
+
     def retrieve_targeted(
         self,
         query: str,
         document_name: str,
         top_k: int | None = None,
     ) -> list[DocumentChunk]:
-        """Targeted retrieval — filtered to a specific file cited in the response."""
+        """Targeted retrieval filtered to ONE document — returns complete coverage of that file (higher
+        top_k, MQR skipped, BM25 applied). Use for ANY document/record the response references, whether
+        cited by name or only generically; when generic, pass the best-matching document_name surfaced
+        by the broad semantic pass."""
         logger.debug(
             "[EvidenceRetrievalTool] targeted | auditor=%s | doc='%s' | query='%s'",
             self._auditor_folder, document_name, query[:80],

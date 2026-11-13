@@ -10,8 +10,10 @@ You have read-only access to the current-year Databricks dashboard tables (disbu
 HCC, OTC, pricing, revenue, and travel & expense). Column layouts vary per table.
 
 Rules:
-- Call sql_db_list_tables FIRST to get the EXACT table names, then sql_db_schema for the EXACT
-  column names before writing any SQL. Do not assume table or column names.
+- Call sql_db_list_tables ONCE to get the EXACT table names. When a DATA DICTIONARY is provided in
+  this prompt, it is authoritative for each table's documented columns — write SQL directly from it
+  and call sql_db_schema ONLY for a column the dictionary does not cover (schema calls are large —
+  keep them minimal). Never assume or invent a table or column name.
 - Do NOT add a scope_id filter — these tables have no scope_id column and already contain only the in-scope audit data.
 - Generate one focused SQL query per table that is relevant to the question.
 - Do not generate queries for tables unrelated to the question.
@@ -32,6 +34,13 @@ SQL_PREFIX_TEMPLATE = (
     "reads a dashboard table. It scopes results to THIS audit; never omit it, and NEVER ask the user "
     "to supply an engagement number — it is given here. If the clause above is blank, simply run "
     "without it.\n\n"
+    "AUDIT SCOPE PERIOD (MANDATORY — bound EVERY query to this period, IN ADDITION to the population "
+    "filter above):\n"
+    "  {scope_period_filter}\n"
+    "  Apply it on EACH table using THAT table's own transaction/posting/billing/event date column "
+    "wrapped in try_cast(`col` AS DATE); exclude any row dated outside the period. A count, total, or "
+    "recipient figure that includes out-of-period rows is invalid. If the line above says no period is "
+    "configured, apply no date bound.\n\n"
     "Rules:\n"
     "  - The DATA DICTIONARY below documents the key columns of each table. USE IT to write queries "
     "directly — you do NOT need sql_db_schema for a table whose columns the dictionary already lists. "
@@ -40,6 +49,24 @@ SQL_PREFIX_TEMPLATE = (
     "  - Do NOT filter by scope_id — these tables have NO scope_id column and already contain only in-scope data.\n"
     "  - Write focused SQL per table relevant to the audit question you receive.\n"
     "  - Cross-validate GL-account and amount claims in the response against the actual table data.\n"
+    "  - LANGUAGE-AGNOSTIC FILTERING: supplier/customer/payee names and free-text descriptions may be "
+    "NON-English (e.g. Korean, Japanese, Arabic). NEVER make a generic English keyword LIKE "
+    "(e.g. '%MEDIA%', '%BROKER%', '%CRO%', '%TENDER%', '%AGENCY%') over a name/description column the "
+    "SOLE or mandatory predicate — in a non-English market it matches nothing and HIDES data that "
+    "exists for the engagement. Prefer STRUCTURED, language-agnostic columns to scope a population "
+    "(GL_ACCOUNT_CODE, HCC_ACCOUNTS, CATEGORY, TRANSACTION_TYPE, GOVT_FLAG, the precomputed *_FLAG "
+    "columns), and ALSO run a broad engagement-only aggregate (GROUP BY the payee, COUNT(*) + USD SUM, "
+    "ORDER BY the amount DESC) so real rows surface regardless of keyword matching. A specific, known "
+    "Latin brand/vendor name is fine to match; a generic English category word is not. Use keyword/name "
+    "matches only to RANK/annotate, never as the gate on the population.\n"
+    "  - STEP BUDGET (you have a LIMITED tool-call budget — each sql_db_list_tables / sql_db_schema / "
+    "sql_db_query call counts toward it): call sql_db_list_tables AT MOST ONCE, and sql_db_schema ONLY "
+    "for a column the DATA DICTIONARY does not already cover (the dictionary already lists the key "
+    "columns — do not re-fetch schema you have). Make at most 3-4 query attempts TOTAL across all "
+    "tables. As soon as you have validating rows, OR you have confirmed no matching rows across the "
+    "relevant dashboards, STOP and write the summary — NEVER loop on near-identical queries. Exhausting "
+    "the budget returns NO evidence at all, which is worse than a concise 'the dashboards do not "
+    "evidence this'.\n"
     "  - Summarise numeric findings in plain English after querying.\n"
     "  - If no relevant data exists, say so explicitly.\n\n"
     "TARGETED LOOKUP STRATEGY (use when the question/response names specific invoices, suppliers/vendors, "
@@ -76,7 +103,8 @@ SQL_PREFIX_TEMPLATE = (
     "The audit question and auditor response are provided in the user message. "
     "Use SQL to retrieve quantitative evidence that validates or contradicts the response.\n\n"
     "GUARDRAILS: Generate SELECT statements only — no INSERT, UPDATE, DELETE, DROP, or any DDL/DML. "
-    "Call sql_db_schema first; do not assume column names. "
+    "Use the DATA DICTIONARY in this prompt for documented columns; call sql_db_schema only for a "
+    "column it does not cover. Do not assume or invent column names. "
     "If a query returns no rows, state that explicitly — do not fabricate results."
 )
 

@@ -17,11 +17,61 @@ class SupportingDocsAgent:
     """
 
     def __init__(self, llm: BaseChatModel, evidence_tool: EvidenceRetrievalTool) -> None:
+        self._evidence_tool = evidence_tool
         self._compiled = self._compile(llm, evidence_tool)
         logger.info(
             "[SupportingDocsAgent] Compiled | name=%s | index=supporting_docs_index | tools=2 (semantic + targeted)",
             AGENT_SUPPORTING_DOCS,
         )
+
+    # Multi-part questions (e.g. "a. TPI inventory ... b. red flags under mitigation") let the ReAct
+    # agent's single query focus on one part and silently drop the other. Red-flag/mitigation evidence
+    # is high-value and easily missed, so fetch it DETERMINISTICALLY when the question asks for it —
+    # independent of whatever query the agent chose. One retrieval call; no agent loop.
+    _RED_FLAG_TERMS = ("red flag", "red-flag", "redflag")
+    _RED_FLAG_QUERY = (
+        "red flag third party mitigation status monitoring under progress remediation decision "
+        "authority RWG conditionally approve FCPA bribery corruption due diligence"
+    )
+
+    @staticmethod
+    def _is_red_flag_name(name: str) -> bool:
+        norm = "".join(ch for ch in (name or "").lower() if ch.isalnum())
+        return "redflag" in norm
+
+    async def red_flag_supplement(self, question_text: str, followup_question: str = "") -> str:
+        """When the question asks about red flags / mitigations, directly retrieve that evidence so it
+        can't be dropped. Pulls EVERY red-flag-named file BY NAME (targeted) — so a critical record (e.g.
+        the one carrying 'Mitigation Status = Not Started') is never lost to semantic top-k variance,
+        which otherwise flips the finding between Risk and No Risk run to run. Falls back to a broad
+        semantic pass when no red-flag-named file exists. '' when not a red-flag question / nothing found."""
+        text = f"{question_text}\n{followup_question}".lower()
+        if not any(t in text for t in self._RED_FLAG_TERMS):
+            return ""
+
+        names = sorted(n for n in self._evidence_tool.doc_names() if self._is_red_flag_name(n))
+        chunks = []
+        for n in names:
+            try:
+                chunks.extend(await self._evidence_tool.aretrieve_targeted(query=self._RED_FLAG_QUERY, document_name=n))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[SupportingDocsAgent] red-flag targeted retrieve failed | doc=%s | %s", n, exc)
+
+        if not chunks:  # no red-flag-named file (or targeting failed) → broad semantic fallback
+            try:
+                chunks = await self._evidence_tool.aretrieve(query=self._RED_FLAG_QUERY)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[SupportingDocsAgent] red-flag supplement failed | %s", exc)
+                return ""
+
+        if not chunks:
+            return ""
+        logger.info(
+            "[SupportingDocsAgent] Red-flag supplement | targeted_files=%d | chunks=%d | docs=%s",
+            len(names), len(chunks), "; ".join(sorted({c.document_name for c in chunks})),
+        )
+        body = "\n\n---\n\n".join(f"[{c.document_name} | TARGETED]\n{c.content}" for c in chunks)
+        return "RED-FLAG / MITIGATION EVIDENCE (deterministic supplement):\n" + body
 
     def _compile(self, llm: BaseChatModel, evidence_tool: EvidenceRetrievalTool):
         @tool

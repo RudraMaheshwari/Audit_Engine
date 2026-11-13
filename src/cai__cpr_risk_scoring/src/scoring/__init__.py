@@ -1,6 +1,7 @@
 """Risk scoring subsystem — the approved Impact x Likelihood matrix and its edge rules."""
 
 from src.scoring.classification import (
+    downgrade_to_further_review,
     is_further_review,
     parse_matrix_axes,
     reconcile_category,
@@ -15,5 +16,6 @@ __all__ = [
     "parse_matrix_axes",
     "reconcile_category",
     "is_further_review",
+    "downgrade_to_further_review",
     "average_category",
 ]

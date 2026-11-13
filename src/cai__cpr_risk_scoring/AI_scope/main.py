@@ -35,6 +35,7 @@ from datetime import datetime
 
 from .src.ai_scope_builder import build_ai_scope
 from .src.config import load_config
+from .src.output_f_loader import load_scope_txn_totals
 from .src.output_writer import write_ai_scope
 try:
     from src.utils.logger import get_logger
@@ -126,7 +127,10 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[AIScope] Could not build LLM for Sheet B structuring — using raw summaries | %s", exc)
             llm = None
-        saved, summary_rows = write_ai_scope(rows, out_path, llm=llm)
+        # Re-pull Output F at Sheet-B time so EVERY scope — including those surfaced only by a KB /
+        # Direction-2 source — gets its exact transaction totals line in the summary story.
+        txn_totals, _grand = load_scope_txn_totals(config)
+        saved, summary_rows = write_ai_scope(rows, out_path, llm=llm, txn_totals=txn_totals)
         print(f"\nSaved AI Scope output to: {saved}")
 
         # Mirror the AI Scope SUMMARY (Sheet B — one row per scope) to a Delta table

@@ -28,6 +28,7 @@ def build_audit_graph(
     transactional_context: str = "",
     recurrence_context: str = "",
     audit_context: str = "",
+    engagement_configured: bool = True,
 ) -> AuditSupervisor:
     logger.info("[Graph] Building audit graph with 8 agents (scope_identifier + classifier + writer)")
     return AuditSupervisor(
@@ -44,4 +45,5 @@ def build_audit_graph(
         transactional_context=transactional_context,
         recurrence_context=recurrence_context,
         audit_context=audit_context,
+        engagement_configured=engagement_configured,
     )
